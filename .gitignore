@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project runtime folders (auto-generated, never committed)
+models/
+data/
+output/

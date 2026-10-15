@@ -1,0 +1,206 @@
+# =============================================================================
+# Vision_Suite — Master Configuration File
+# Every configurable value in the entire system lives here. No exceptions.
+# =============================================================================
+
+project:
+  name: "Vision_Suite"
+  version: "0.1.0"
+  device: "cpu"                     # locked for now, future-proofed for "cuda"
+
+# -----------------------------------------------------------------------------
+# PATHS — all relative to project root, auto-created at runtime if missing
+# -----------------------------------------------------------------------------
+paths:
+  models_dir: "models"
+  data_dir: "data"
+  faces_dir: "data/faces"
+  embeddings_dir: "data/embeddings"
+  face_db_path: "models/face_recognition/face_db.pkl"
+  output_dir: "output"
+  logs_dir: "output/logs"
+  crops_dir: "output/crops"
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  system_log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  system_log_max_bytes: 5242880     # 5 MB per log file before rotation
+  system_log_backup_count: 5
+  event_log_cooldown_seconds: 10    # min seconds before re-logging same track_id
+  event_csv_columns:
+    - "timestamp"
+    - "event_type"
+    - "camera_id"
+    - "class_or_name"
+    - "confidence"
+    - "bbox_x1"
+    - "bbox_y1"
+    - "bbox_x2"
+    - "bbox_y2"
+    - "crop_path"
+    - "track_id"
+
+# -----------------------------------------------------------------------------
+# MODELS — auto-downloaded on first use, cached in models/, reused after
+# -----------------------------------------------------------------------------
+models:
+  object_detection:
+    name: "yolov8n"
+    weights_url: "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
+    weights_filename: "yolov8n.pt"
+    onnx_filename: "yolov8n.onnx"
+    class_names_path: "configs/coco_classes.yaml" 
+    input_size: [640, 640]
+    confidence_threshold: 0.45
+    iou_threshold: 0.45
+    classes_filter: null             # null = all COCO classes, or e.g. ["person", "car"]
+
+  face_detection:
+    name: "scrfd"
+    provider: "insightface"
+    pack_name: "buffalo_s"
+    confidence_threshold: 0.5
+    input_size: [640, 640]
+
+  face_recognition:
+    name: "arcface"
+    provider: "insightface"
+    pack_name: "buffalo_s"
+    similarity_threshold: 0.45
+    embedding_size: 512
+
+  onnx_providers:
+    - "CPUExecutionProvider"
+
+# -----------------------------------------------------------------------------
+# TRACKING — assigns persistent track_id, enables cooldown-based save/log
+# -----------------------------------------------------------------------------
+tracking:
+  type: "iou"                        # options: "iou", "bytetrack"
+  iou_threshold: 0.3
+  max_age: 30                        # frames to keep a lost track alive
+  min_hits: 3                        # frames before a track is confirmed
+
+# -----------------------------------------------------------------------------
+# RESOLUTION — display (UI clarity) vs inference (CPU performance), decoupled
+# -----------------------------------------------------------------------------
+resolution:
+  display:
+    width: 1280
+    height: 720
+  inference:
+    width: 640
+    height: 480
+
+# -----------------------------------------------------------------------------
+# DISPLAY — multi-camera rendering mode
+# -----------------------------------------------------------------------------
+display:
+  mode: "grid"                       # options: "grid", "multi_window"
+  grid_columns: 2
+  window_name_prefix: "Vision_Suite"
+
+# -----------------------------------------------------------------------------
+# CAMERAS — add/remove/enable as many as needed, each fully independent
+# -----------------------------------------------------------------------------
+cameras:
+  - id: "webcam"
+    enabled: true
+    type: "live"                     # offline, live, rtsp
+    source: 0
+    transport: null
+    frame_skip: 0
+    reconnect_delay_seconds: 5
+    display_resolution: null         # null = inherit global default above
+    inference_resolution: null
+
+  - id: "usb_cam"
+    enabled: false
+    type: "live"
+    source: 1
+    transport: null
+    frame_skip: 0
+    reconnect_delay_seconds: 5
+    display_resolution: null
+    inference_resolution: null
+
+  - id: "entry_gate"
+    enabled: false
+    type: "rtsp"
+    source: "rtsp://username:password@192.168.1.10:554/stream1"
+    transport: "tcp"                 # tcp (reliable) or udp (lower latency)
+    frame_skip: 2
+    reconnect_delay_seconds: 5
+    display_resolution: null
+    inference_resolution: null
+
+  - id: "sample_video"
+    enabled: false
+    type: "offline"
+    source: "data/sample_videos/sample.mp4"
+    transport: null
+    frame_skip: 0
+    reconnect_delay_seconds: 5
+    display_resolution: null
+    inference_resolution: null
+
+# -----------------------------------------------------------------------------
+# DETECTION TOGGLES
+# -----------------------------------------------------------------------------
+detection:
+  enable_object_detection: true
+  enable_face_detection: true
+
+# -----------------------------------------------------------------------------
+# CROPS — used by `frs crops`
+# -----------------------------------------------------------------------------
+crops:
+  save_object_crops: true
+  save_face_crops: true
+  crop_padding: 10
+  min_crop_size: 40
+  cooldown_seconds: 5
+  object_crop_dir: "output/crops/objects"
+  face_crop_dir: "output/crops/faces"
+  unknown_crop_dir: "output/crops/unknown"
+
+# -----------------------------------------------------------------------------
+# DATA COLLECTION — used by `frs collect`, edit this section per enrollment
+# -----------------------------------------------------------------------------
+data_collection:
+  person_name: "John_Doe"
+  overwrite_if_exists: true
+  details:
+    employee_id: "EMP1023"
+    department: "Security"
+  poses:
+    - "straight"
+    - "left"
+    - "right"
+    - "up"
+    - "down"
+  samples_per_pose: 15
+  capture_interval_seconds: 0.3
+  quality_checks:
+    min_brightness: 60
+    max_brightness: 200
+    blur_threshold: 100
+    min_face_size_px: 80
+
+# -----------------------------------------------------------------------------
+# RECOGNITION — used by `frs recognize`
+# -----------------------------------------------------------------------------
+recognition:
+  similarity_threshold: 0.45
+  unknown_label: "unknown"
+  save_crops: true
+  cooldown_seconds: 5
+  recognize_crop_dir: "output/crops/recognized"
+
+# -----------------------------------------------------------------------------
+# SYSTEM — future feature placeholders
+# -----------------------------------------------------------------------------
+system:
+  enable_ear_mar: false              # placeholder only, logs "not implemented yet"

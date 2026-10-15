@@ -135,3 +135,7 @@ project-root/
    with threaded capture + anti-lag buffer)
 4. Test video_source.py independently across all 3 input modes before
    building anything else on top of it
+
+
+
+   Continuing the Vision_Suite project. Here's our PROGRESS.md: [paste content]. Let's start with Step 1 — writing config.yaml.
