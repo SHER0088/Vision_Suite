@@ -23,7 +23,10 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
 
-from src.core.config_loader import AppConfig
+# NOTE: AppConfig is imported lazily inside functions that need it at runtime.
+# It's only used in type annotations (which are strings due to
+# `from __future__ import annotations`), so no top-level import is needed.
+# This avoids a circular import with config_loader.py.
 
 
 # =============================================================================
@@ -31,6 +34,7 @@ from src.core.config_loader import AppConfig
 # =============================================================================
 
 _system_logger_configured = False
+_system_logger_lock = threading.Lock()
 
 
 def setup_system_logger(config: AppConfig) -> logging.Logger:
@@ -47,38 +51,52 @@ def setup_system_logger(config: AppConfig) -> logging.Logger:
     if _system_logger_configured:
         return logger
 
-    logs_dir = Path(config.paths.logs_dir)
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    with _system_logger_lock:
+        if _system_logger_configured:
+            return logger
 
-    today_str = date.today().isoformat()
-    log_file = logs_dir / f"system_{today_str}.log"
+        try:
+            logs_dir = Path(config.paths.logs_dir)
+            logs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"Failed to create logs directory {config.paths.logs_dir}: {e}") from e
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        today_str = date.today().isoformat()
+        log_file = logs_dir / f"system_{today_str}.log"
 
-    # Rotating file handler - rolls over within the same day if it exceeds max_bytes
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=str(log_file),
-        maxBytes=config.logging.system_log_max_bytes,
-        backupCount=config.logging.system_log_backup_count,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
-    # Also print to console so you see what's happening live during CLI runs
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+        try:
+            # Rotating file handler - rolls over within the same day if it exceeds max_bytes
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=str(log_file),
+                maxBytes=config.logging.system_log_max_bytes,
+                backupCount=config.logging.system_log_backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+        except OSError as e:
+            raise RuntimeError(f"Failed to create rotating file handler for {log_file}: {e}") from e
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    logger.propagate = False
+        # Also print to console so you see what's happening live during CLI runs
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
 
-    _system_logger_configured = True
+        try:
+            logger.addHandler(file_handler)
+            logger.addHandler(console_handler)
+        except Exception as e:
+            raise RuntimeError(f"Failed to add handlers to logger: {e}") from e
 
-    logger.info(f"System logger initialized. Writing to: {log_file}")
-    return logger
+        logger.propagate = False
+
+        _system_logger_configured = True
+
+        logger.info(f"System logger initialized. Writing to: {log_file}")
+        return logger
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -101,26 +119,29 @@ class EventLogger:
     Writes detection/recognition events to a daily CSV file.
 
     Cooldown logic: an event for the same (camera_id, track_id, event_type)
-    combination will only be written once per `cooldown_seconds`. This is
-    what prevents 30 rows/second for a person standing still in frame.
+    combination is throttled so we don't flood the file with a row every
+    single frame. Uses a bounded cooldown cache to prevent memory leaks.
     """
 
-    def __init__(self, config: AppConfig):
-        self.config = config
+    def __init__(self, config: AppConfig) -> None:
+        self.logger = logging.getLogger("vision_suite.logger")
         self.logs_dir = Path(config.paths.logs_dir)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-
-        self.columns = config.logging.event_csv_columns
-        self.cooldown_seconds = config.logging.event_log_cooldown_seconds
-
+        try:
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.logger.error(f"Failed to create logs directory {config.paths.logs_dir}: {e}")
+            raise
+        self.cooldown_seconds = float(config.logging.event_log_cooldown_seconds)
+        self.columns = config.logging.event_csv_columns or [
+            "timestamp", "event_type", "camera_id", "class_or_name",
+            "confidence", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+            "crop_path", "track_id",
+        ]
         self._lock = threading.Lock()
         self._last_logged: Dict[Tuple[str, Any, str], float] = {}
         self._current_date: Optional[str] = None
         self._current_path: Optional[Path] = None
-
-        self._ensure_file_ready()
-
-    # ------------------------------------------------------------------ #
+        self._max_cooldown_cache = 10000  # prevent unbounded memory growth
 
     def _ensure_file_ready(self) -> None:
         """Opens/creates today's CSV file, writing header if it's new."""
@@ -134,18 +155,41 @@ class EventLogger:
 
         file_exists = self._current_path.exists()
         if not file_exists:
-            with open(self._current_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(self.columns)
+            try:
+                with open(self._current_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(self.columns)
+            except OSError as e:
+                self.logger.error(f"Failed to create event log file {self._current_path}: {e}")
+                raise
 
     def _cooldown_key(self, camera_id: str, track_id: Any, event_type: str) -> Tuple[str, Any, str]:
-        return (camera_id, track_id, event_type)
+        # Ensure track_id is hashable; if not, convert to string for use as dict key
+        try:
+            hash(track_id)
+        except TypeError:
+            self.logger.warning(
+                f"track_id {track_id!r} is not hashable; converting to string for cooldown key"
+            )
+            track_id_for_key = str(track_id)
+        else:
+            track_id_for_key = track_id
+        return (camera_id, track_id_for_key, event_type)
 
     def _is_on_cooldown(self, key: Tuple[str, Any, str], now: float) -> bool:
         last_time = self._last_logged.get(key)
         if last_time is None:
             return False
         return (now - last_time) < self.cooldown_seconds
+
+    def _cleanup_old_cooldowns(self, now: float) -> None:
+        """Remove cooldown entries older than 2x the cooldown period to bound memory."""
+        if len(self._last_logged) <= self._max_cooldown_cache:
+            return
+        cutoff = now - (self.cooldown_seconds * 2)
+        stale_keys = [k for k, t in self._last_logged.items() if t < cutoff]
+        for k in stale_keys:
+            del self._last_logged[k]
 
     # ------------------------------------------------------------------ #
 
@@ -170,11 +214,15 @@ class EventLogger:
         Set force=True to bypass cooldown (e.g., for one-off system events
         you still want in the CSV).
         """
+        if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
+            raise ValueError(f"bbox must be a 4-tuple (x1, y1, x2, y2), got: {bbox}")
+
         now = datetime.now().timestamp()
         key = self._cooldown_key(camera_id, track_id, event_type)
 
         with self._lock:
             self._ensure_file_ready()  # handles midnight rollover mid-session
+            self._cleanup_old_cooldowns(now)
 
             if not force and self._is_on_cooldown(key, now):
                 return False
@@ -185,10 +233,10 @@ class EventLogger:
                 "camera_id": camera_id,
                 "class_or_name": class_or_name,
                 "confidence": round(float(confidence), 4),
-                "bbox_x1": bbox[0],
-                "bbox_y1": bbox[1],
-                "bbox_x2": bbox[2],
-                "bbox_y2": bbox[3],
+                "bbox_x1": int(bbox[0]),
+                "bbox_y1": int(bbox[1]),
+                "bbox_x2": int(bbox[2]),
+                "bbox_y2": int(bbox[3]),
                 "crop_path": crop_path,
                 "track_id": track_id,
             }
@@ -196,9 +244,13 @@ class EventLogger:
             if self._current_path is None:
                 raise RuntimeError("Event log path is not initialized")
 
-            with open(self._current_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.columns)
-                writer.writerow(row)
+            try:
+                with open(self._current_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.columns)
+                    writer.writerow(row)
+            except OSError as e:
+                self.logger.error(f"Failed to write to event log file {self._current_path}: {e}")
+                raise
 
             self._last_logged[key] = now
             return True

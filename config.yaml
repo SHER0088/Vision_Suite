@@ -9,6 +9,39 @@ project:
   device: "cpu"                     # locked for now, future-proofed for "cuda"
 
 # -----------------------------------------------------------------------------
+# INPUT — single input type, multiple sources of that type.
+#
+#   type: "web_cam"  -> read camera_indices (device indices, e.g. [0, 1])
+#   type: "video"    -> read video_paths   (offline file paths)
+#   type: "live"     -> read rtsp_urls     (RTSP stream URLs)
+#
+# Only the section matching `type` is read. Each source gets its own
+# capture thread, frame buffer, and preview window. The number of preview
+# windows equals the number of sources listed for the selected type.
+# -----------------------------------------------------------------------------
+input:
+  type: "video"                    # video | web_cam | live
+
+  # Web camera / USB camera device indices (used when type == "web_cam")
+  camera_indices: [0]
+
+  # Offline video file paths (used when type == "video")
+  video_paths:
+    - "data/sample_videos/sample.mp4"
+
+  # RTSP stream URLs (used when type == "live")
+  rtsp_urls:
+    - "rtsp://username:password@192.168.1.10:554/stream1"
+
+  # Shared settings applied to ALL inputs of the selected type
+  frame_skip: 0
+  reconnect_delay_seconds: 5
+  transport: "tcp"                   # tcp (reliable) or udp (lower latency) — RTSP only
+
+  display_resolution: null           # null = inherit global default below
+  inference_resolution: null         # null = inherit global default below
+
+# -----------------------------------------------------------------------------
 # PATHS — all relative to project root, auto-created at runtime if missing
 # -----------------------------------------------------------------------------
 paths:
@@ -51,7 +84,7 @@ models:
     weights_url: "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
     weights_filename: "yolov8n.pt"
     onnx_filename: "yolov8n.onnx"
-    class_names_path: "configs/coco_classes.yaml" 
+    class_names_path: "configs/coco_classes.yaml"
     input_size: [640, 640]
     confidence_threshold: 0.45
     iou_threshold: 0.45
@@ -101,50 +134,6 @@ display:
   mode: "grid"                       # options: "grid", "multi_window"
   grid_columns: 2
   window_name_prefix: "Vision_Suite"
-
-# -----------------------------------------------------------------------------
-# CAMERAS — add/remove/enable as many as needed, each fully independent
-# -----------------------------------------------------------------------------
-cameras:
-  - id: "webcam"
-    enabled: true
-    type: "live"                     # offline, live, rtsp
-    source: 0
-    transport: null
-    frame_skip: 0
-    reconnect_delay_seconds: 5
-    display_resolution: null         # null = inherit global default above
-    inference_resolution: null
-
-  - id: "usb_cam"
-    enabled: false
-    type: "live"
-    source: 1
-    transport: null
-    frame_skip: 0
-    reconnect_delay_seconds: 5
-    display_resolution: null
-    inference_resolution: null
-
-  - id: "entry_gate"
-    enabled: false
-    type: "rtsp"
-    source: "rtsp://username:password@192.168.1.10:554/stream1"
-    transport: "tcp"                 # tcp (reliable) or udp (lower latency)
-    frame_skip: 2
-    reconnect_delay_seconds: 5
-    display_resolution: null
-    inference_resolution: null
-
-  - id: "sample_video"
-    enabled: false
-    type: "offline"
-    source: "data/sample_videos/sample.mp4"
-    transport: null
-    frame_skip: 0
-    reconnect_delay_seconds: 5
-    display_resolution: null
-    inference_resolution: null
 
 # -----------------------------------------------------------------------------
 # DETECTION TOGGLES

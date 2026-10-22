@@ -1,15 +1,37 @@
+# Vision_Suite — pinned for Windows + Python 3.11 + CPU-only
+# Do NOT loosen pins without re-testing: ML sibling packages break each other.
+
+# Core numerical / CV
 numpy==1.26.4
 opencv-python==4.10.0.84
+
+# Config / validation
 pydantic==2.9.2
 PyYAML==6.0.2
+
+# CLI
 typer[all]==0.12.5
 click==8.1.7
 rich==13.8.1
+
+# Deep learning (CPU). Install torch/vision FROM THE CPU INDEX (see setup notes below).
+# torch 2.4.1 avoids the dynamo/onnxscript export path that newer torch defaults to.
+torch==2.4.1
+torchvision==0.19.1
+
+# ONNX stack — MUST stay matched (IR version skew = load failure)
+# onnx 1.16.x writes IR <=12/13; onnxruntime 1.19.x supports up to IR 10–13.
+# onnx>=1.20 writes IR 14 and breaks ort 1.19.x — do not upgrade.
 onnx==1.16.1
 onnxruntime==1.19.2
 ultralytics==8.3.0
-insightface==0.7.3
+
+# Face detection + recognition (SCRFD + ArcFace via buffalo_s)
+# Prefer the prebuilt Windows cp311 wheel (avoids MSVC Cython build):
+insightface @ https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl
+# If the wheel URL ever 404s and you already have MSVC Build Tools installed, fall back to:
+# insightface==0.7.3
+
+# Utilities
 requests==2.32.3
 tqdm==4.66.5
-torch==2.4.1
-torchvision==0.19.1

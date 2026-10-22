@@ -1,262 +1,282 @@
-"""
-config_loader.py
------------------
-Single source of truth for loading, validating, and exposing config.yaml
-throughout the entire application. Nothing in this project reads config.yaml
-directly except this file.
+"""Configuration loader and Pydantic validation schema for Vision_Suite.
 
-Uses Pydantic for strict validation - bad config values fail LOUD and CLEAR
-at startup instead of causing mysterious crashes mid-execution.
+The config.yaml is the single source of truth for all system values.
+A new top-level `input` section replaces the old flat `cameras` list:
+
+    input:
+      type: "web_cam"          # video | web_cam | live
+      camera_indices: [0, 1]   # used when type == "web_cam"
+      video_paths: [...]       # used when type == "video"
+      rtsp_urls: [...]         # used when type == "live"
+      ...
+
+Only the section matching `type` is read. Each source gets its own
+capture thread, frame buffer, and preview window.
 """
 
 from __future__ import annotations
 
-import sys
-from importlib import import_module
 from pathlib import Path
-from typing import List, Optional, Union, Dict, Any
-
+from typing import Any, Dict, List, Optional, Union
 import yaml
 
-try:
-    _pydantic = import_module("pydantic")
-except ModuleNotFoundError as exc:
-    if exc.name != "pydantic":
-        raise
-    raise ImportError(
-        "Pydantic is required to load the application configuration. "
-        "Install it with `python -m pip install pydantic`."
-    ) from exc
-
-BaseModel = _pydantic.BaseModel
-Field = _pydantic.Field
-field_validator = _pydantic.field_validator
-model_validator = _pydantic.model_validator
-ValidationError = _pydantic.ValidationError
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-# =============================================================================
-# SCHEMA DEFINITIONS
-# =============================================================================
+# --- SCHEMAS ---
 
-class ProjectConfig(BaseModel):
-    name: str
-    version: str
-    device: str = "cpu"
+class BaseConfigModel(BaseModel):
+    """Base model: disables protected namespaces warning, allows extra fields
+    so the config can evolve without breaking validation."""
+    model_config = ConfigDict(protected_namespaces=(), extra="allow")
 
-
-class PathsConfig(BaseModel):
-    models_dir: str
-    data_dir: str
-    faces_dir: str
-    embeddings_dir: str
-    face_db_path: str
-    output_dir: str
-    logs_dir: str
-    crops_dir: str
+    @staticmethod
+    def _parse_input_size(v: Any) -> int:
+        if isinstance(v, list) and len(v) > 0:
+            return int(v[0])
+        return int(v)
 
 
-class LoggingConfig(BaseModel):
-    system_log_level: str = "INFO"
-    system_log_max_bytes: int = 5_242_880
-    system_log_backup_count: int = 5
-    event_log_cooldown_seconds: float = 10.0
-    event_csv_columns: List[str]
-
-    @field_validator("system_log_level")
-    @classmethod
-    def validate_log_level(cls, v: str) -> str:
-        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-        if v.upper() not in allowed:
-            raise ValueError(f"system_log_level must be one of {allowed}, got '{v}'")
-        return v.upper()
-
-
-class ObjectDetectionModelConfig(BaseModel):
-    name: str
-    weights_url: str
-    weights_filename: str
-    onnx_filename: str
-    class_names_path: str
-    input_size: List[int] = Field(min_length=2, max_length=2)
-    confidence_threshold: float = Field(ge=0.0, le=1.0)
-    iou_threshold: float = Field(ge=0.0, le=1.0)
-    classes_filter: Optional[List[str]] = None
-
-
-class FaceDetectionModelConfig(BaseModel):
-    name: str
-    provider: str
-    pack_name: str
-    confidence_threshold: float = Field(ge=0.0, le=1.0)
-    input_size: List[int] = Field(min_length=2, max_length=2)
-
-
-class FaceRecognitionModelConfig(BaseModel):
-    name: str
-    provider: str
-    pack_name: str
-    similarity_threshold: float = Field(ge=0.0, le=1.0)
-    embedding_size: int
-
-
-class ModelsConfig(BaseModel):
-    object_detection: ObjectDetectionModelConfig
-    face_detection: FaceDetectionModelConfig
-    face_recognition: FaceRecognitionModelConfig
-    onnx_providers: List[str]
-
-
-class TrackingConfig(BaseModel):
-    type: str
-    iou_threshold: float = Field(ge=0.0, le=1.0)
-    max_age: int = Field(gt=0)
-    min_hits: int = Field(gt=0)
+class InputSourceConfig(BaseConfigModel):
+    """Single input section — one type, multiple sources of that type."""
+    type: str = Field(
+        default="web_cam",
+        description="Input type: 'web_cam' (device indices), 'video' (file paths), or 'live' (RTSP URLs)",
+    )
+    camera_indices: List[int] = Field(
+        default_factory=lambda: [0],
+        description="Device indices for web_cam / usb_cam inputs",
+    )
+    video_paths: List[str] = Field(
+        default_factory=list,
+        description="Offline video file paths for video input",
+    )
+    rtsp_urls: List[str] = Field(
+        default_factory=list,
+        description="RTSP stream URLs for live input",
+    )
+    frame_skip: Optional[int] = 0
+    reconnect_delay_seconds: Optional[int] = 5
+    transport: Optional[str] = "tcp"
+    display_resolution: Optional["ResolutionItem"] = None
+    inference_resolution: Optional["ResolutionItem"] = None
 
     @field_validator("type")
     @classmethod
     def validate_type(cls, v: str) -> str:
-        allowed = {"iou", "bytetrack"}
-        if v not in allowed:
-            raise ValueError(f"tracking.type must be one of {allowed}, got '{v}'")
-        return v
-
-
-class ResolutionItem(BaseModel):
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-
-    def as_tuple(self) -> tuple:
-        return (self.width, self.height)
-
-
-class ResolutionConfig(BaseModel):
-    display: ResolutionItem
-    inference: ResolutionItem
-
-
-class DisplayConfig(BaseModel):
-    mode: str
-    grid_columns: int = Field(gt=0)
-    window_name_prefix: str = "Vision_Suite"
-
-    @field_validator("mode")
-    @classmethod
-    def validate_mode(cls, v: str) -> str:
-        allowed = {"grid", "multi_window"}
-        if v not in allowed:
-            raise ValueError(f"display.mode must be one of {allowed}, got '{v}'")
-        return v
-
-
-class CameraConfig(BaseModel):
-    id: str
-    enabled: bool = True
-    type: str
-    source: Union[int, str]
-    transport: Optional[str] = None
-    frame_skip: int = Field(ge=0, default=0)
-    reconnect_delay_seconds: float = Field(gt=0, default=5.0)
-    display_resolution: Optional[List[int]] = None
-    inference_resolution: Optional[List[int]] = None
-
-    @field_validator("type")
-    @classmethod
-    def validate_type(cls, v: str) -> str:
-        allowed = {"offline", "live", "rtsp"}
-        if v not in allowed:
-            raise ValueError(f"camera.type must be one of {allowed}, got '{v}'")
-        return v
+        allowed = {"video", "web_cam", "live"}
+        if v.lower() not in allowed:
+            raise ValueError(f"input.type must be one of {sorted(allowed)}, got: {v!r}")
+        return v.lower()
 
     @field_validator("transport")
     @classmethod
     def validate_transport(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return v
-        allowed = {"tcp", "udp"}
-        if v not in allowed:
-            raise ValueError(f"camera.transport must be one of {allowed} or null, got '{v}'")
-        return v
+        if v is not None and v.lower() not in {"tcp", "udp"}:
+            raise ValueError(f"input.transport must be 'tcp' or 'udp', got: {v!r}")
+        return v.lower() if v else v
 
-    @model_validator(mode="after")
-    def validate_source_matches_type(self) -> "CameraConfig":
-        if self.type == "live" and not isinstance(self.source, int):
-            try:
-                self.source = int(self.source)
-            except (ValueError, TypeError):
-                raise ValueError(
-                    f"Camera '{self.id}': type 'live' requires an integer camera index as source."
-                )
-        if self.type == "rtsp" and not isinstance(self.source, str):
-            raise ValueError(f"Camera '{self.id}': type 'rtsp' requires a URL string as source.")
-        if self.type == "offline" and not isinstance(self.source, str):
-            raise ValueError(f"Camera '{self.id}': type 'offline' requires a file path string as source.")
-        return self
+    def active_sources(self) -> List[Dict[str, Any]]:
+        """Return the list of sources for the configured type.
+
+        Each entry is a dict with keys: id, type, source (int or str),
+        plus shared settings. This is what VideoSourceManager consumes.
+        """
+        t = self.type
+        sources: List[Dict[str, Any]] = []
+
+        if t == "web_cam":
+            for idx, cam_idx in enumerate(self.camera_indices):
+                sources.append({
+                    "id": f"webcam_{cam_idx}",
+                    "type": "live",
+                    "source": cam_idx,
+                    "enabled": True,
+                    "frame_skip": self.frame_skip,
+                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
+                    "transport": self.transport,
+                    "display_resolution": self.display_resolution,
+                    "inference_resolution": self.inference_resolution,
+                })
+        elif t == "video":
+            for idx, path in enumerate(self.video_paths):
+                sources.append({
+                    "id": f"video_{idx}",
+                    "type": "offline",
+                    "source": path,
+                    "enabled": True,
+                    "frame_skip": self.frame_skip,
+                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
+                    "transport": None,
+                    "display_resolution": self.display_resolution,
+                    "inference_resolution": self.inference_resolution,
+                })
+        elif t == "live":
+            for idx, url in enumerate(self.rtsp_urls):
+                sources.append({
+                    "id": f"rtsp_{idx}",
+                    "type": "rtsp",
+                    "source": url,
+                    "enabled": True,
+                    "frame_skip": self.frame_skip,
+                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
+                    "transport": self.transport,
+                    "display_resolution": self.display_resolution,
+                    "inference_resolution": self.inference_resolution,
+                })
+
+        return sources
 
 
-class DetectionConfig(BaseModel):
-    enable_object_detection: bool
-    enable_face_detection: bool
+class ProjectConfig(BaseConfigModel):
+    name: str = "Vision_Suite"
+    version: str = "0.1.0"
+    device: str = "cpu"
+    description: Optional[str] = "Vision Suite Pipeline"
 
 
-class CropsConfig(BaseModel):
-    save_object_crops: bool
-    save_face_crops: bool
-    crop_padding: int = Field(ge=0)
-    min_crop_size: int = Field(gt=0)
-    cooldown_seconds: float = Field(ge=0)
-    object_crop_dir: str
-    face_crop_dir: str
-    unknown_crop_dir: str
+class PathsConfig(BaseConfigModel):
+    models_dir: str = "models"
+    data_dir: str = "data"
+    faces_dir: Optional[str] = "data/faces"
+    embeddings_dir: Optional[str] = "data/embeddings"
+    face_db_path: Optional[str] = "models/face_recognition/face_db.pkl"
+    output_dir: str = "output"
+    logs_dir: str = "output/logs"
+    crops_dir: str = "output/crops"
 
 
-class QualityChecksConfig(BaseModel):
-    min_brightness: float = Field(ge=0, le=255)
-    max_brightness: float = Field(ge=0, le=255)
-    blur_threshold: float = Field(ge=0)
-    min_face_size_px: int = Field(gt=0)
+class LoggingConfig(BaseConfigModel):
+    system_log_level: Optional[str] = "INFO"
+    system_log_file: Optional[str] = "output/logs/system.log"
+    system_log_max_bytes: Optional[int] = 5242880
+    system_log_backup_count: Optional[int] = 5
+    event_log_cooldown_seconds: Optional[float] = 10.0
+    log_cooldown_seconds: Optional[float] = 5.0
+    events_csv_file: Optional[str] = "output/logs/events.csv"
+    event_csv_columns: Optional[List[str]] = None
+    rotation: Optional[str] = "1 day"
+    retention: Optional[str] = "7 days"
 
-    @model_validator(mode="after")
-    def validate_brightness_range(self) -> "QualityChecksConfig":
-        if self.min_brightness >= self.max_brightness:
-            raise ValueError("min_brightness must be less than max_brightness")
-        return self
 
+class ObjectDetectionModelConfig(BaseConfigModel):
+    name: str = "yolov8n"
+    weights_url: str = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
+    weights_filename: str = "yolov8n.pt"
+    onnx_filename: str = "yolov8n.onnx"
+    class_names_path: str = "configs/coco_classes.yaml"
+    confidence_threshold: float = 0.45
+    iou_threshold: float = 0.45
+    input_size: Union[int, List[int]] = 640
+    classes_filter: Optional[List[Any]] = None
 
-class DataCollectionConfig(BaseModel):
-    person_name: str
-    overwrite_if_exists: bool
-    details: Dict[str, Any] = {}
-    poses: List[str] = Field(min_length=1)
-    samples_per_pose: int = Field(gt=0)
-    capture_interval_seconds: float = Field(ge=0)
-    quality_checks: QualityChecksConfig
-
-    @field_validator("person_name")
+    @field_validator("input_size", mode="before")
     @classmethod
-    def validate_person_name(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("data_collection.person_name cannot be empty")
-        # Keep it filesystem-safe since it becomes a folder name
-        invalid_chars = set('<>:"/\\|?*')
-        if any(ch in invalid_chars for ch in v):
-            raise ValueError(f"person_name '{v}' contains invalid filesystem characters")
-        return v
+    def parse_input_size(cls, v: Any) -> int:
+        return cls._parse_input_size(v)
 
 
-class RecognitionConfig(BaseModel):
-    similarity_threshold: float = Field(ge=0.0, le=1.0)
-    unknown_label: str
-    save_crops: bool
-    cooldown_seconds: float = Field(ge=0)
-    recognize_crop_dir: str
+class FaceDetectionModelConfig(BaseConfigModel):
+    name: str = "scrfd"
+    provider: str = "insightface"
+    pack_name: str = "buffalo_s"
+    confidence_threshold: float = 0.5
+    input_size: Union[int, List[int]] = 640
+    det_size: List[int] = [640, 640]
+
+    @field_validator("input_size", mode="before")
+    @classmethod
+    def parse_input_size(cls, v: Any) -> int:
+        return cls._parse_input_size(v)
 
 
-class SystemConfig(BaseModel):
+class FaceRecognitionModelConfig(BaseConfigModel):
+    name: str = "arcface"
+    provider: str = "insightface"
+    pack_name: str = "buffalo_s"
+    similarity_threshold: float = 0.45
+    embedding_size: int = 512
+    metric: str = "cosine"
+
+
+class ModelsConfig(BaseConfigModel):
+    onnx_providers: List[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
+    object_detection: ObjectDetectionModelConfig
+    face_detection: FaceDetectionModelConfig
+    face_recognition: FaceRecognitionModelConfig
+
+
+class TrackingConfig(BaseConfigModel):
+    type: Optional[str] = "iou"
+    iou_threshold: float = 0.3
+    max_age: int = 30
+    min_hits: int = 3
+
+
+class ResolutionItem(BaseConfigModel):
+    width: int
+    height: int
+
+    def as_tuple(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
+
+class ResolutionConfig(BaseConfigModel):
+    display: ResolutionItem
+    inference: ResolutionItem
+
+
+class DisplayConfig(BaseConfigModel):
+    mode: str = "grid"
+    grid_columns: int = 2
+    window_name_prefix: str = "Vision_Suite"
+
+
+class DetectionConfig(BaseConfigModel):
+    enable_object_detection: bool = True
+    enable_face_detection: bool = True
+
+
+class CropsConfig(BaseConfigModel):
+    save_object_crops: bool = True
+    save_face_crops: bool = True
+    crop_padding: int = 10
+    min_crop_size: int = 40
+    cooldown_seconds: float = 5.0
+    object_crop_dir: str = "output/crops/objects"
+    face_crop_dir: str = "output/crops/faces"
+    unknown_crop_dir: str = "output/crops/unknown"
+
+
+class QualityChecksConfig(BaseConfigModel):
+    min_brightness: float = 40.0
+    max_brightness: float = 220.0
+    blur_threshold: float = 80.0
+    min_face_size_px: int = 80
+
+
+class DataCollectionConfig(BaseConfigModel):
+    person_name: str = "John_Doe"
+    overwrite_if_exists: bool = True
+    details: Dict[str, Any] = Field(default_factory=dict)
+    poses: List[str] = Field(default_factory=lambda: ["straight", "left", "right", "up", "down"])
+    samples_per_pose: int = 15
+    capture_interval_seconds: float = 0.5
+    quality_checks: QualityChecksConfig = Field(default_factory=QualityChecksConfig)
+
+
+class RecognitionConfig(BaseConfigModel):
+    save_crops: bool = True
+    cooldown_seconds: float = 5.0
+    unknown_label: str = "unknown"
+    draw_landmarks: bool = False
+
+
+class SystemConfig(BaseConfigModel):
     enable_ear_mar: bool = False
 
 
-class AppConfig(BaseModel):
+class AppConfig(BaseConfigModel):
     project: ProjectConfig
     paths: PathsConfig
     logging: LoggingConfig
@@ -264,111 +284,99 @@ class AppConfig(BaseModel):
     tracking: TrackingConfig
     resolution: ResolutionConfig
     display: DisplayConfig
-    cameras: List[CameraConfig]
+    input: InputSourceConfig
     detection: DetectionConfig
     crops: CropsConfig
     data_collection: DataCollectionConfig
     recognition: RecognitionConfig
     system: SystemConfig
 
-    @model_validator(mode="after")
-    def validate_unique_camera_ids(self) -> "AppConfig":
-        ids = [cam.id for cam in self.cameras]
-        duplicates = {i for i in ids if ids.count(i) > 1}
-        if duplicates:
-            raise ValueError(f"Duplicate camera ids found in config: {duplicates}")
-        return self
 
-    def get_camera(self, camera_id: str) -> CameraConfig:
-        for cam in self.cameras:
-            if cam.id == camera_id:
-                return cam
-        raise KeyError(f"No camera with id '{camera_id}' found in config.yaml")
+# --- CONFIG LOADER SINGLETON ---
 
-    def enabled_cameras(self) -> List[CameraConfig]:
-        return [cam for cam in self.cameras if cam.enabled]
+_config_instance: Optional[AppConfig] = None
 
 
-# =============================================================================
-# LOADING LOGIC
-# =============================================================================
+def find_config_path(explicit_path: Optional[str] = None) -> Path:
+    """Find config.yaml at explicit path, CWD, or by walking up parent directories."""
+    if explicit_path:
+        p = Path(explicit_path)
+        if p.exists():
+            return p
 
-_CONFIG_CACHE: Optional[AppConfig] = None
+    cwd_path = Path.cwd() / "config.yaml"
+    if cwd_path.exists():
+        return cwd_path
+
+    current_path = Path(__file__).resolve()
+    for parent in current_path.parents:
+        config_path = parent / "config.yaml"
+        if config_path.exists():
+            return config_path
+
+    checked_paths = [cwd_path]
+    for i, parent in enumerate(current_path.parents):
+        if i >= 5:
+            break
+        checked_paths.append(parent / "config.yaml")
+
+    raise FileNotFoundError(
+        f"config.yaml not found! Checked:\n"
+        + "\n".join(f" - {p}" for p in checked_paths)
+    )
 
 
-def load_config(config_path: Union[str, Path] = "config.yaml") -> AppConfig:
-    """
-    Loads, validates, and returns the full application config.
-    Raises SystemExit with a clear, human-readable error on failure
-    instead of letting a raw traceback confuse the user.
-    """
-    path = Path(config_path)
+def load_config(config_path: Optional[str] = None) -> AppConfig:
+    """Load config.yaml, validate using AppConfig Pydantic model."""
+    global _config_instance
 
-    if not path.exists():
-        print(f"[CONFIG ERROR] config.yaml not found at: {path.resolve()}")
-        sys.exit(1)
+    target_path = find_config_path(config_path)
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
+        with target_path.open("r", encoding="utf-8") as f:
+            raw_dict = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        print(f"[CONFIG ERROR] Failed to parse config.yaml - invalid YAML syntax:\n{e}")
-        sys.exit(1)
+        raise ValueError(f"Invalid YAML in config file {target_path}: {e}") from e
+    except OSError as e:
+        raise OSError(f"Cannot read config file {target_path}: {e}") from e
 
-    if raw is None:
-        print("[CONFIG ERROR] config.yaml is empty.")
-        sys.exit(1)
+    if raw_dict is None:
+        raise ValueError(f"Config file {target_path} is empty or contains only comments")
 
-    try:
-        config = AppConfig(**raw)
-    except ValidationError as e:
-        print("[CONFIG ERROR] config.yaml failed validation:\n")
-        for err in e.errors():
-            loc = " -> ".join(str(p) for p in err["loc"])
-            print(f"  - {loc}: {err['msg']}")
-        sys.exit(1)
-
-    return config
+    _config_instance = AppConfig(**raw_dict)
+    return _config_instance
 
 
-def get_config(config_path: Union[str, Path] = "config.yaml", force_reload: bool = False) -> AppConfig:
-    """
-    Returns a cached singleton config instance so the file isn't re-read
-    and re-validated every time a module needs it.
-    """
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is None or force_reload:
-        _CONFIG_CACHE = load_config(config_path)
-    return _CONFIG_CACHE
+def get_config() -> AppConfig:
+    """Get loaded singleton config, or load default."""
+    global _config_instance
+    if _config_instance is None:
+        _config_instance = load_config()
+    return _config_instance
 
 
 def ensure_runtime_directories(config: AppConfig) -> None:
-    """
-    Creates all required output/data/model directories at runtime if missing.
-    Called once at the start of every CLI command.
-    """
+    """Ensure runtime folders (output/, logs/, crops/, models/, data/) exist."""
+    from src.core.logger import get_logger  # lazy import to avoid circular import
+
+    logger = get_logger("config_loader")
+    project_root = Path(__file__).resolve().parents[2]
+
     dirs_to_create = [
-        config.paths.models_dir,
-        config.paths.data_dir,
-        config.paths.faces_dir,
-        config.paths.embeddings_dir,
-        Path(config.paths.face_db_path).parent,
-        config.paths.output_dir,
-        config.paths.logs_dir,
-        config.paths.crops_dir,
-        config.crops.object_crop_dir,
-        config.crops.face_crop_dir,
-        config.crops.unknown_crop_dir,
-        config.recognition.recognize_crop_dir,
+        project_root / config.paths.models_dir / "object_detection",
+        project_root / config.paths.models_dir / "face_detection",
+        project_root / config.paths.models_dir / "face_recognition",
+        project_root / config.paths.data_dir / "faces",
+        project_root / config.paths.data_dir / "embeddings",
+        project_root / config.paths.output_dir / "logs",
+        project_root / config.paths.output_dir / "crops" / "objects",
+        project_root / config.paths.output_dir / "crops" / "faces",
+        project_root / config.paths.output_dir / "crops" / "recognized",
     ]
-    for d in dirs_to_create:
-        Path(d).mkdir(parents=True, exist_ok=True)
 
-
-if __name__ == "__main__":
-    # Quick manual sanity check: run `python src/core/config_loader.py`
-    cfg = load_config("config.yaml")
-    ensure_runtime_directories(cfg)
-    print("config.yaml loaded and validated successfully.")
-    print(f"Project: {cfg.project.name} v{cfg.project.version}")
-    print(f"Enabled cameras: {[c.id for c in cfg.enabled_cameras()]}")
+    for directory in dirs_to_create:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Failed to create directory {directory}: {e}")
+            raise
