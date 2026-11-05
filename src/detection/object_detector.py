@@ -14,6 +14,7 @@ import yaml
 from src.core.config_loader import AppConfig
 from src.core.logger import get_logger
 from src.core.model_downloader import ensure_file
+from src.detection.letterbox_utils import letterbox
 
 logger = get_logger("object_detector")
 
@@ -200,29 +201,13 @@ class ObjectDetector:
             return []
 
         h0, w0 = frame_bgr.shape[:2]
-        inp, gain, pad = self._letterbox(frame_bgr, self.input_size)
+        inp, gain, pad = letterbox(frame_bgr, self.input_size)
 
         blob = inp[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
         blob = np.ascontiguousarray(blob[np.newaxis, ...])
 
         outputs = self.session.run([self.output_name], {self.input_name: blob})[0]
         return self._postprocess(outputs, gain, pad, w0, h0)
-
-    def _letterbox(
-        self, img: np.ndarray, new_size: int
-    ) -> Tuple[np.ndarray, float, Tuple[float, float]]:
-        h, w = img.shape[:2]
-        r = min(new_size / h, new_size / w)
-        nw, nh = int(round(w * r)), int(round(h * r))
-        pad_w, pad_h = (new_size - nw) / 2, (new_size - nh) / 2
-
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        top, bottom = int(round(pad_h - 0.1)), int(round(pad_h + 0.1))
-        left, right = int(round(pad_w - 0.1)), int(round(pad_w + 0.1))
-        out = cv2.copyMakeBorder(
-            resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
-        )
-        return out, r, (pad_w, pad_h)
 
     def _postprocess(
         self,

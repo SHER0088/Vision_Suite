@@ -1,242 +1,297 @@
-"""Configuration loader and Pydantic validation schema for Vision_Suite.
+"""
+Configuration loader and Pydantic validation schema for Vision_Suite.
 
-The config.yaml is the single source of truth for all system values.
-A new top-level `input` section replaces the old flat `cameras` list:
-
-    input:
-      type: "web_cam"          # video | web_cam | live
-      camera_indices: [0, 1]   # used when type == "web_cam"
-      video_paths: [...]       # used when type == "video"
-      rtsp_urls: [...]         # used when type == "live"
-      ...
-
-Only the section matching `type` is read. Each source gets its own
-capture thread, frame buffer, and preview window.
+config.yaml is the single source of truth. Every runtime value is read from
+config.yaml — nothing is hardcoded in Python. All sections from the master
+configuration blueprint are represented here.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, List, Optional
+
 import yaml
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict
 
-
-# --- SCHEMAS ---
 
 class BaseConfigModel(BaseModel):
-    """Base model: disables protected namespaces warning, allows extra fields
-    so the config can evolve without breaking validation."""
     model_config = ConfigDict(protected_namespaces=(), extra="allow")
 
-    @staticmethod
-    def _parse_input_size(v: Any) -> int:
-        if isinstance(v, list) and len(v) > 0:
-            return int(v[0])
-        return int(v)
 
-
-class InputSourceConfig(BaseConfigModel):
-    """Single input section — one type, multiple sources of that type."""
-    type: str = Field(
-        default="web_cam",
-        description="Input type: 'web_cam' (device indices), 'video' (file paths), or 'live' (RTSP URLs)",
-    )
-    camera_indices: List[int] = Field(
-        default_factory=lambda: [0],
-        description="Device indices for web_cam / usb_cam inputs",
-    )
-    video_paths: List[str] = Field(
-        default_factory=list,
-        description="Offline video file paths for video input",
-    )
-    rtsp_urls: List[str] = Field(
-        default_factory=list,
-        description="RTSP stream URLs for live input",
-    )
-    frame_skip: Optional[int] = 0
-    reconnect_delay_seconds: Optional[int] = 5
-    transport: Optional[str] = "tcp"
-    display_resolution: Optional["ResolutionItem"] = None
-    inference_resolution: Optional["ResolutionItem"] = None
-
-    @field_validator("type")
-    @classmethod
-    def validate_type(cls, v: str) -> str:
-        allowed = {"video", "web_cam", "live"}
-        if v.lower() not in allowed:
-            raise ValueError(f"input.type must be one of {sorted(allowed)}, got: {v!r}")
-        return v.lower()
-
-    @field_validator("transport")
-    @classmethod
-    def validate_transport(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and v.lower() not in {"tcp", "udp"}:
-            raise ValueError(f"input.transport must be 'tcp' or 'udp', got: {v!r}")
-        return v.lower() if v else v
-
-    def active_sources(self) -> List[Dict[str, Any]]:
-        """Return the list of sources for the configured type.
-
-        Each entry is a dict with keys: id, type, source (int or str),
-        plus shared settings. This is what VideoSourceManager consumes.
-        """
-        t = self.type
-        sources: List[Dict[str, Any]] = []
-
-        if t == "web_cam":
-            for idx, cam_idx in enumerate(self.camera_indices):
-                sources.append({
-                    "id": f"webcam_{cam_idx}",
-                    "type": "live",
-                    "source": cam_idx,
-                    "enabled": True,
-                    "frame_skip": self.frame_skip,
-                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
-                    "transport": self.transport,
-                    "display_resolution": self.display_resolution,
-                    "inference_resolution": self.inference_resolution,
-                })
-        elif t == "video":
-            for idx, path in enumerate(self.video_paths):
-                sources.append({
-                    "id": f"video_{idx}",
-                    "type": "offline",
-                    "source": path,
-                    "enabled": True,
-                    "frame_skip": self.frame_skip,
-                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
-                    "transport": None,
-                    "display_resolution": self.display_resolution,
-                    "inference_resolution": self.inference_resolution,
-                })
-        elif t == "live":
-            for idx, url in enumerate(self.rtsp_urls):
-                sources.append({
-                    "id": f"rtsp_{idx}",
-                    "type": "rtsp",
-                    "source": url,
-                    "enabled": True,
-                    "frame_skip": self.frame_skip,
-                    "reconnect_delay_seconds": self.reconnect_delay_seconds,
-                    "transport": self.transport,
-                    "display_resolution": self.display_resolution,
-                    "inference_resolution": self.inference_resolution,
-                })
-
-        return sources
-
-
+# ---------------------------------------------------------------------------
+# project
+# ---------------------------------------------------------------------------
 class ProjectConfig(BaseConfigModel):
     name: str = "Vision_Suite"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
+    environment: str = "development"
+
+
+# ---------------------------------------------------------------------------
+# runtime
+# ---------------------------------------------------------------------------
+class RuntimeConfig(BaseConfigModel):
     device: str = "cpu"
-    description: Optional[str] = "Vision Suite Pipeline"
+    random_seed: int = 42
+    deterministic: bool = True
+    num_threads: int = 4
+    multiprocessing: bool = False
+    graceful_shutdown: bool = True
 
 
+# ---------------------------------------------------------------------------
+# paths
+# ---------------------------------------------------------------------------
 class PathsConfig(BaseConfigModel):
     models_dir: str = "models"
     data_dir: str = "data"
-    faces_dir: Optional[str] = "data/faces"
-    embeddings_dir: Optional[str] = "data/embeddings"
-    face_db_path: Optional[str] = "models/face_recognition/face_db.pkl"
+    raw_faces_dir: str = "data/faces/raw"
+    processed_faces_dir: str = "data/faces/processed"
+    embeddings_dir: str = "data/embeddings"
+    database_dir: str = "data/database"
     output_dir: str = "output"
     logs_dir: str = "output/logs"
     crops_dir: str = "output/crops"
+    reports_dir: str = "output/reports"
+    temporary_dir: str = "output/tmp"
+    legacy_face_db_path: str = "models/face_recognition/face_db.pkl"
 
 
-class LoggingConfig(BaseConfigModel):
-    system_log_level: Optional[str] = "INFO"
-    system_log_file: Optional[str] = "output/logs/system.log"
-    system_log_max_bytes: Optional[int] = 5242880
-    system_log_backup_count: Optional[int] = 5
-    event_log_cooldown_seconds: Optional[float] = 10.0
-    log_cooldown_seconds: Optional[float] = 5.0
-    events_csv_file: Optional[str] = "output/logs/events.csv"
-    event_csv_columns: Optional[List[str]] = None
-    rotation: Optional[str] = "1 day"
-    retention: Optional[str] = "7 days"
+# ---------------------------------------------------------------------------
+# input
+# ---------------------------------------------------------------------------
+class InputBufferConfig(BaseConfigModel):
+    max_frames: int = 2
+    drop_oldest: bool = True
 
 
+class InputSourceConfig(BaseConfigModel):
+    id: Optional[str] = None
+    type: str = "web_cam"
+    index: int = 0
+    enabled: bool = True
+    camera_settings: Optional[dict] = None
+
+
+class CameraConfig(BaseConfigModel):
+    brightness: int = 0
+    contrast: int = 0
+    saturation: int = 0
+    exposure: int = 0
+    focus: int = 0
+    gain: int = 0
+
+
+class InputConfig(BaseConfigModel):
+    type: str = "video"
+    camera: Optional[CameraConfig] = None
+    camera_indices: List[int] = [0]
+    video_paths: List[str] = []
+    rtsp_urls: List[str] = []
+    reconnect_delay_seconds: int = 5
+    max_reconnect_attempts: int = 0
+    open_timeout_seconds: int = 10
+    read_timeout_seconds: int = 10
+    transport: str = "tcp"
+    buffer: InputBufferConfig = InputBufferConfig()
+    display_resolution: Optional[Any] = None
+    inference_resolution: Optional[Any] = None
+    sources: List[InputSourceConfig] = []
+
+    def active_sources(self) -> List[InputSourceConfig]:
+        """Return only the enabled input sources."""
+        return [source for source in self.sources if source.enabled]
+
+
+# ---------------------------------------------------------------------------
+# performance
+# ---------------------------------------------------------------------------
+class ProfilingConfig(BaseConfigModel):
+    enabled: bool = False
+    report_interval_seconds: int = 30
+    measure_preprocessing: bool = True
+    measure_inference: bool = True
+    measure_postprocessing: bool = True
+
+
+class PerformanceConfig(BaseConfigModel):
+    frame_skip: int = 0
+    inference_interval_ms: int = 0
+    max_inference_fps: int = 0
+    warmup_iterations: int = 3
+    resize_before_inference: bool = True
+    max_concurrent_inferences: int = 1
+    batch_size: int = 1
+    profiling: ProfilingConfig = ProfilingConfig()
+
+
+# ---------------------------------------------------------------------------
+# models
+# ---------------------------------------------------------------------------
 class ObjectDetectionModelConfig(BaseConfigModel):
+    enabled: bool = True
+    backend: str = "ultralytics"
     name: str = "yolov8n"
-    weights_url: str = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
-    weights_filename: str = "yolov8n.pt"
+    weights_path: str = "models/detection/yolov8n.pt"
+    weights_url: str = (
+        "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
+    )
     onnx_filename: str = "yolov8n.onnx"
     class_names_path: str = "configs/coco_classes.yaml"
+    input_size: Any = [640, 640]
     confidence_threshold: float = 0.45
     iou_threshold: float = 0.45
-    input_size: Union[int, List[int]] = 640
-    classes_filter: Optional[List[Any]] = None
-
-    @field_validator("input_size", mode="before")
-    @classmethod
-    def parse_input_size(cls, v: Any) -> int:
-        return cls._parse_input_size(v)
+    classes_filter: Optional[List[int]] = None
 
 
 class FaceDetectionModelConfig(BaseConfigModel):
+    enabled: bool = True
+    backend: str = "insightface"
     name: str = "scrfd"
-    provider: str = "insightface"
     pack_name: str = "buffalo_s"
-    confidence_threshold: float = 0.5
-    input_size: Union[int, List[int]] = 640
-    det_size: List[int] = [640, 640]
-
-    @field_validator("input_size", mode="before")
-    @classmethod
-    def parse_input_size(cls, v: Any) -> int:
-        return cls._parse_input_size(v)
+    weights_filename: str = "yolov8n-face.onnx"
+    weights_url: str = (
+        "https://github.com/derronqi/yolov8-face/releases/download/v0.1/yolov8n-face.onnx"
+    )
+    confidence_threshold: float = 0.50
+    nms_iou_threshold: float = 0.45
+    input_size: Any = [640, 640]
+    min_face_size_px: int = 40
 
 
 class FaceRecognitionModelConfig(BaseConfigModel):
-    name: str = "arcface"
-    provider: str = "insightface"
+    enabled: bool = True
+    backend: str = "insightface"
+    model_name: str = "arcface"
     pack_name: str = "buffalo_s"
-    similarity_threshold: float = 0.45
     embedding_size: int = 512
-    metric: str = "cosine"
+    normalize_embeddings: bool = True
+    inference_provider: str = "CPUExecutionProvider"
 
 
 class ModelsConfig(BaseConfigModel):
-    onnx_providers: List[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
-    object_detection: ObjectDetectionModelConfig
-    face_detection: FaceDetectionModelConfig
-    face_recognition: FaceRecognitionModelConfig
+    download_policy: str = "if_missing"
+    verify_downloads: bool = True
+    cache_enabled: bool = True
+    onnx_providers: List[str] = ["CPUExecutionProvider"]
+    object_detection: ObjectDetectionModelConfig = ObjectDetectionModelConfig()
+    face_detection: FaceDetectionModelConfig = FaceDetectionModelConfig()
+    face_recognition: FaceRecognitionModelConfig = FaceRecognitionModelConfig()
+
+
+# ---------------------------------------------------------------------------
+# recognition
+# ---------------------------------------------------------------------------
+class RecognitionMatchingConfig(BaseConfigModel):
+    top_k: int = 5
+    minimum_margin: float = 0.05
+    require_quality_check: bool = True
+
+
+class RecognitionTemporalConfig(BaseConfigModel):
+    enabled: bool = True
+    min_consecutive_matches: int = 3
+    voting_window: int = 5
+
+
+class RecognitionConfig(BaseConfigModel):
+    similarity_metric: str = "cosine"
+    similarity_threshold: float = 0.45
+    unknown_label: str = "unknown"
+    matching: RecognitionMatchingConfig = RecognitionMatchingConfig()
+    temporal_confirmation: RecognitionTemporalConfig = RecognitionTemporalConfig()
+    duplicate_embedding_threshold: float = 0.98
+    save_crops: bool = True
+    crop_dir: str = "output/crops/recognized"
+    recognize_crop_dir: str = "output/crops/recognized"
+    cooldown_seconds: float = 5.0
+
+
+# ---------------------------------------------------------------------------
+# data_collection
+# ---------------------------------------------------------------------------
+class DataCollectionQualityChecksConfig(BaseConfigModel):
+    enabled: bool = True
+    min_brightness: int = 60
+    max_brightness: int = 200
+    blur_threshold: int = 100
+    min_face_size_px: int = 80
+    reject_multiple_faces: bool = True
+    reject_duplicate_images: bool = True
+
+
+class DataCollectionConfig(BaseConfigModel):
+    output_root: str = "data/faces/raw"
+    samples_per_pose: int = 15
+    capture_interval_seconds: float = 0.3
+    max_samples_per_person: int = 300
+    allowed_image_extensions: List[str] = [".jpg", ".jpeg", ".png"]
+    poses: List[str] = ["straight", "left", "right", "up", "down"]
+    quality_checks: DataCollectionQualityChecksConfig = DataCollectionQualityChecksConfig()
+
+
+# ---------------------------------------------------------------------------
+# enrollment
+# ---------------------------------------------------------------------------
+class EnrollmentConfig(BaseConfigModel):
+    auto_generate_identity_code: bool = True
+    identity_code_prefix: str = "EMP"
+    default_name: str = ""
+    default_employee_id: str = ""
+    require_unique_employee_id: bool = True
+    overwrite_if_exists: bool = False
+    require_confirmation_for_overwrite: bool = True
+    require_minimum_samples: int = 10
+    generate_embeddings_after_collection: bool = True
+    allow_incremental_enrollment: bool = True
+    metadata_fields: List[str] = ["employee_id", "department"]
+
+
+# ---------------------------------------------------------------------------
+# database
+# ---------------------------------------------------------------------------
+class EmbeddingIndexConfig(BaseConfigModel):
+    backend: str = "faiss"
+    index_type: str = "FlatIP"
+    normalize_vectors: bool = True
+
+
+class DatabasePersistenceConfig(BaseConfigModel):
+    autosave: bool = True
+    backup_enabled: bool = True
+    backup_interval_hours: int = 24
+
+
+class DatabaseConfig(BaseConfigModel):
+    backend: str = "sqlite"
+    sqlite_path: str = "data/database/faces.db"
+    embedding_index: EmbeddingIndexConfig = EmbeddingIndexConfig()
+    persistence: DatabasePersistenceConfig = DatabasePersistenceConfig()
+
+
+# ---------------------------------------------------------------------------
+# tracking
+# ---------------------------------------------------------------------------
+class TrackingIdentitySmoothingConfig(BaseConfigModel):
+    enabled: bool = True
+    history_size: int = 5
+    minimum_votes: int = 3
 
 
 class TrackingConfig(BaseConfigModel):
-    type: Optional[str] = "iou"
-    iou_threshold: float = 0.3
+    enabled: bool = True
+    type: str = "iou"
+    iou_threshold: float = 0.30
     max_age: int = 30
     min_hits: int = 3
+    identity_smoothing: TrackingIdentitySmoothingConfig = TrackingIdentitySmoothingConfig()
 
 
-class ResolutionItem(BaseConfigModel):
-    width: int
-    height: int
-
-    def as_tuple(self) -> tuple[int, int]:
-        return (self.width, self.height)
-
-
-class ResolutionConfig(BaseConfigModel):
-    display: ResolutionItem
-    inference: ResolutionItem
-
-
-class DisplayConfig(BaseConfigModel):
-    mode: str = "grid"
-    grid_columns: int = 2
-    window_name_prefix: str = "Vision_Suite"
-
-
-class DetectionConfig(BaseConfigModel):
-    enable_object_detection: bool = True
-    enable_face_detection: bool = True
-
-
+# ---------------------------------------------------------------------------
+# crops
+# ---------------------------------------------------------------------------
 class CropsConfig(BaseConfigModel):
     save_object_crops: bool = True
     save_face_crops: bool = True
@@ -248,51 +303,172 @@ class CropsConfig(BaseConfigModel):
     unknown_crop_dir: str = "output/crops/unknown"
 
 
-class QualityChecksConfig(BaseConfigModel):
-    min_brightness: float = 40.0
-    max_brightness: float = 220.0
-    blur_threshold: float = 80.0
-    min_face_size_px: int = 80
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+class OutputConfig(BaseConfigModel):
+    save_detection_results: bool = True
+    save_event_csv: bool = True
+    save_annotated_video: bool = False
+    image_format: str = "jpg"
+    jpeg_quality: int = 90
 
 
-class DataCollectionConfig(BaseConfigModel):
-    person_name: str = "John_Doe"
-    overwrite_if_exists: bool = True
-    details: Dict[str, Any] = Field(default_factory=dict)
-    poses: List[str] = Field(default_factory=lambda: ["straight", "left", "right", "up", "down"])
-    samples_per_pose: int = 15
-    capture_interval_seconds: float = 0.5
-    quality_checks: QualityChecksConfig = Field(default_factory=QualityChecksConfig)
+# ---------------------------------------------------------------------------
+# logging
+# ---------------------------------------------------------------------------
+class LoggingConfig(BaseConfigModel):
+    level: str = "INFO"
+    max_bytes: int = 5242880
+    backup_count: int = 5
+    console_enabled: bool = True
+    file_enabled: bool = True
+    structured_json: bool = False
+    event_log_cooldown_seconds: int = 10
 
 
-class RecognitionConfig(BaseConfigModel):
-    save_crops: bool = True
-    cooldown_seconds: float = 5.0
-    unknown_label: str = "unknown"
-    draw_landmarks: bool = False
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+class EventsConfig(BaseConfigModel):
+    enabled: bool = True
+    cooldown_seconds: int = 10
+    include_unknown_faces: bool = True
+    csv_columns: List[str] = [
+        "timestamp",
+        "event_type",
+        "camera_id",
+        "class_or_name",
+        "confidence",
+        "bbox_x1",
+        "bbox_y1",
+        "bbox_x2",
+        "bbox_y2",
+        "crop_path",
+        "track_id",
+    ]
 
 
+# ---------------------------------------------------------------------------
+# resolution
+# ---------------------------------------------------------------------------
+class ResolutionItemConfig(BaseConfigModel):
+    width: int = 640
+    height: int = 480
+
+
+class ResolutionConfig(BaseConfigModel):
+    display: ResolutionItemConfig = ResolutionItemConfig(width=1280, height=720)
+    inference: ResolutionItemConfig = ResolutionItemConfig(width=640, height=480)
+
+
+# ---------------------------------------------------------------------------
+# display
+# ---------------------------------------------------------------------------
+class DisplayConfig(BaseConfigModel):
+    mode: str = "grid"
+    grid_columns: int = 2
+    window_name_prefix: str = "Vision_Suite"
+    show_fps: bool = True
+    show_confidence: bool = True
+    show_track_id: bool = True
+    show_unknown_label: bool = True
+    bbox_thickness: int = 3
+    tight_bbox: bool = True
+    circle_overlay: bool = True
+    show_landmarks: bool = True
+    enrollment_visuals: bool = True
+
+
+# ---------------------------------------------------------------------------
+# features
+# ---------------------------------------------------------------------------
+class FeaturesConfig(BaseConfigModel):
+    object_detection: bool = True
+    face_detection: bool = True
+    face_recognition: bool = True
+    tracking: bool = True
+    data_collection: bool = True
+    event_logging: bool = True
+    ear_mar: bool = False
+    anti_spoofing: bool = False
+
+
+# ---------------------------------------------------------------------------
+# detection
+# ---------------------------------------------------------------------------
+class DetectionConfig(BaseConfigModel):
+    enable_object_detection: bool = True
+    enable_face_detection: bool = True
+
+
+# ---------------------------------------------------------------------------
+# system
+# ---------------------------------------------------------------------------
 class SystemConfig(BaseConfigModel):
     enable_ear_mar: bool = False
 
 
+# ---------------------------------------------------------------------------
+# evaluation
+# ---------------------------------------------------------------------------
+class EvaluationBenchmarkConfig(BaseConfigModel):
+    enabled: bool = False
+    warmup_iterations: int = 5
+    measurement_iterations: int = 100
+    report_cpu_memory: bool = True
+    report_latency_percentiles: bool = True
+
+
+class EvaluationConfig(BaseConfigModel):
+    enabled: bool = False
+    dataset_dir: str = "data/evaluation"
+    output_dir: str = "output/reports"
+    recognition_metrics: List[str] = [
+        "precision",
+        "recall",
+        "false_acceptance_rate",
+        "false_rejection_rate",
+    ]
+    benchmark: EvaluationBenchmarkConfig = EvaluationBenchmarkConfig()
+
+
+# ---------------------------------------------------------------------------
+# privacy
+# ---------------------------------------------------------------------------
+class PrivacyConfig(BaseConfigModel):
+    delete_raw_faces_after_enrollment: bool = False
+    unknown_crop_retention_days: int = 30
+    event_retention_days: int = 90
+    require_authorized_enrollment: bool = True
+
+
+# ---------------------------------------------------------------------------
+# AppConfig — top level
+# ---------------------------------------------------------------------------
 class AppConfig(BaseConfigModel):
+    config_version: str = "2.0"
     project: ProjectConfig
+    runtime: RuntimeConfig
     paths: PathsConfig
-    logging: LoggingConfig
+    input: InputConfig
+    performance: PerformanceConfig
     models: ModelsConfig
+    recognition: RecognitionConfig
+    data_collection: DataCollectionConfig
+    enrollment: EnrollmentConfig
+    database: DatabaseConfig
     tracking: TrackingConfig
+    crops: CropsConfig
+    output: OutputConfig
+    logging: LoggingConfig
+    events: EventsConfig
     resolution: ResolutionConfig
     display: DisplayConfig
-    input: InputSourceConfig
-    detection: DetectionConfig
-    crops: CropsConfig
-    data_collection: DataCollectionConfig
-    recognition: RecognitionConfig
-    system: SystemConfig
+    features: FeaturesConfig
+    evaluation: EvaluationConfig
+    privacy: PrivacyConfig
 
-
-# --- CONFIG LOADER SINGLETON ---
 
 _config_instance: Optional[AppConfig] = None
 
@@ -321,8 +497,7 @@ def find_config_path(explicit_path: Optional[str] = None) -> Path:
         checked_paths.append(parent / "config.yaml")
 
     raise FileNotFoundError(
-        f"config.yaml not found! Checked:\n"
-        + "\n".join(f" - {p}" for p in checked_paths)
+        f"config.yaml not found! Checked:\n" + "\n".join(f" - {p}" for p in checked_paths)
     )
 
 
@@ -356,22 +531,32 @@ def get_config() -> AppConfig:
 
 
 def ensure_runtime_directories(config: AppConfig) -> None:
-    """Ensure runtime folders (output/, logs/, crops/, models/, data/) exist."""
+    """Ensure runtime folders exist from config.yaml paths."""
     from src.core.logger import get_logger  # lazy import to avoid circular import
 
     logger = get_logger("config_loader")
     project_root = Path(__file__).resolve().parents[2]
 
     dirs_to_create = [
-        project_root / config.paths.models_dir / "object_detection",
+        project_root / config.paths.models_dir,
+        project_root / config.paths.data_dir,
+        project_root / config.paths.raw_faces_dir,
+        project_root / config.paths.processed_faces_dir,
+        project_root / config.paths.embeddings_dir,
+        project_root / config.paths.database_dir,
+        project_root / config.paths.output_dir,
+        project_root / config.paths.logs_dir,
+        project_root / config.paths.crops_dir,
+        project_root / config.paths.reports_dir,
+        project_root / config.paths.temporary_dir,
+        # Model subdirectories
         project_root / config.paths.models_dir / "face_detection",
         project_root / config.paths.models_dir / "face_recognition",
-        project_root / config.paths.data_dir / "faces",
-        project_root / config.paths.data_dir / "embeddings",
-        project_root / config.paths.output_dir / "logs",
-        project_root / config.paths.output_dir / "crops" / "objects",
-        project_root / config.paths.output_dir / "crops" / "faces",
-        project_root / config.paths.output_dir / "crops" / "recognized",
+        project_root / config.paths.models_dir / "object_detection",
+        # Database parent
+        Path(config.database.sqlite_path).parent,
+        # Legacy face db parent
+        project_root / Path(config.paths.legacy_face_db_path).parent,
     ]
 
     for directory in dirs_to_create:

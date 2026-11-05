@@ -175,7 +175,7 @@ class _CaptureThread(threading.Thread):
                     if self.transport == "tcp":
                         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
                     elif self.transport == "udp":
-                        os.environ["OPENCF_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
                     else:
                         if "OPENCV_FFMPEG_CAPTURE_OPTIONS" in os.environ:
                             del os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
@@ -211,26 +211,92 @@ class _CaptureThread(threading.Thread):
             return False
 
     def _apply_camera_properties(self) -> None:
-        """Apply resolution, FPS, and buffer-size hints to the capture device.
+        """Apply resolution, FPS, buffer-size hints, and image controls to the capture device.
 
         Best-effort: many USB/webcam drivers ignore some of these, but setting
         them improves quality and reduces latency on the ones that honor them.
+
+        Camera image controls (brightness, contrast, saturation, exposure,
+        focus, gain) are read from the per-source config under a
+        ``camera_settings`` mapping (or as flat keys on the source config) and
+        are applied only when present, so omitted keys leave the driver
+        default untouched.
         """
         if self.cap is None:
             return
 
-        try:
-            w, h = self.display_res
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(w))
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(h))
-            self.cap.set(cv2.CAP_PROP_FPS, 30.0)
-            # Minimize internal buffering so we always get the freshest frame
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
-            # Try autofocus (ignored if unsupported)
+        def _set(prop_id: int, value: float) -> None:
             try:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1.0)
+                self.cap.set(prop_id, float(value))
             except Exception:
                 pass
+
+        try:
+            w, h = self.display_res
+            _set(cv2.CAP_PROP_FRAME_WIDTH, float(w))
+            _set(cv2.CAP_PROP_FRAME_HEIGHT, float(h))
+            _set(cv2.CAP_PROP_FPS, 30.0)
+            # Minimize internal buffering so we always get the freshest frame
+            _set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
+
+            # --- Per-source camera image controls from config ---
+            camera_settings = self.cfg.get("camera_settings") or {}
+            flat_keys = ("brightness", "contrast", "saturation", "exposure", "focus", "gain")
+            settings: Dict[str, float] = {}
+            for key in flat_keys:
+                if key in camera_settings and camera_settings[key] is not None:
+                    settings[key] = camera_settings[key]
+                elif key in self.cfg and self.cfg[key] is not None:
+                    settings[key] = self.cfg[key]
+
+            brightness = settings.get("brightness")
+            contrast = settings.get("contrast")
+            saturation = settings.get("saturation")
+            exposure = settings.get("exposure")
+            focus = settings.get("focus")
+            gain = settings.get("gain")
+
+            if brightness is not None:
+                _set(cv2.CAP_PROP_BRIGHTNESS, brightness)
+            if contrast is not None:
+                _set(cv2.CAP_PROP_CONTRAST, contrast)
+            if saturation is not None:
+                _set(cv2.CAP_PROP_SATURATION, saturation)
+
+            # Exposure/gain often require disabling auto mode before a manual
+            # value sticks on many drivers (V4L2, DSHOW, etc.).
+            auto_exposure = getattr(cv2, "CAP_PROP_AUTO_EXPOSURE", None)
+            if exposure is not None and auto_exposure is not None:
+                try:
+                    self.cap.set(auto_exposure, 0.25)  # manual mode
+                except Exception:
+                    pass
+            if exposure is not None:
+                _set(cv2.CAP_PROP_EXPOSURE, exposure)
+
+            auto_gain = getattr(cv2, "CAP_PROP_AUTOGAIN", None)
+            if gain is not None and auto_gain is not None:
+                try:
+                    self.cap.set(auto_gain, 0.0)  # manual mode
+                except Exception:
+                    pass
+            if gain is not None:
+                _set(cv2.CAP_PROP_GAIN, gain)
+
+            autofocus = getattr(cv2, "CAP_PROP_AUTOFOCUS", None)
+            if focus is not None and autofocus is not None:
+                # Disable autofocus so a manual focus value can take effect.
+                try:
+                    self.cap.set(autofocus, 0.0)
+                except Exception:
+                    pass
+                _set(cv2.CAP_PROP_FOCUS, focus)
+            elif autofocus is not None:
+                # Try autofocus (ignored if unsupported)
+                try:
+                    self.cap.set(autofocus, 1.0)
+                except Exception:
+                    pass
         except Exception as exc:
             logger.warning(
                 "[%s] Could not apply camera properties: %s", self.camera_id, exc

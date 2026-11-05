@@ -1,68 +1,291 @@
 # =============================================================================
-# Vision_Suite — Master Configuration File
-# Every configurable value in the entire system lives here. No exceptions.
+# Vision_Suite — Master Configuration
+# Version: 0.2.0
 # =============================================================================
+
+config_version: "2.0"
 
 project:
   name: "Vision_Suite"
-  version: "0.1.0"
-  device: "cpu"                     # locked for now, future-proofed for "cuda"
+  version: "0.2.0"
+  environment: "development"
 
 # -----------------------------------------------------------------------------
-# INPUT — single input type, multiple sources of that type.
-#
-#   type: "web_cam"  -> read camera_indices (device indices, e.g. [0, 1])
-#   type: "video"    -> read video_paths   (offline file paths)
-#   type: "live"     -> read rtsp_urls     (RTSP stream URLs)
-#
-# Only the section matching `type` is read. Each source gets its own
-# capture thread, frame buffer, and preview window. The number of preview
-# windows equals the number of sources listed for the selected type.
+# RUNTIME
 # -----------------------------------------------------------------------------
-input:
-  type: "video"                    # video | web_cam | live
-
-  # Web camera / USB camera device indices (used when type == "web_cam")
-  camera_indices: [0]
-
-  # Offline video file paths (used when type == "video")
-  video_paths:
-    - "data/sample_videos/sample.mp4"
-
-  # RTSP stream URLs (used when type == "live")
-  rtsp_urls:
-    - "rtsp://username:password@192.168.1.10:554/stream1"
-
-  # Shared settings applied to ALL inputs of the selected type
-  frame_skip: 0
-  reconnect_delay_seconds: 5
-  transport: "tcp"                   # tcp (reliable) or udp (lower latency) — RTSP only
-
-  display_resolution: null           # null = inherit global default below
-  inference_resolution: null         # null = inherit global default below
+runtime:
+  device: "cpu"
+  random_seed: 42
+  deterministic: true
+  num_threads: 4
+  multiprocessing: false
+  graceful_shutdown: true
 
 # -----------------------------------------------------------------------------
-# PATHS — all relative to project root, auto-created at runtime if missing
+# PATHS
+# All relative paths resolve against the project root.
 # -----------------------------------------------------------------------------
 paths:
   models_dir: "models"
   data_dir: "data"
-  faces_dir: "data/faces"
+  raw_faces_dir: "data/faces/raw"
+  processed_faces_dir: "data/faces/processed"
   embeddings_dir: "data/embeddings"
-  face_db_path: "models/face_recognition/face_db.pkl"
+  database_dir: "data/database"
   output_dir: "output"
   logs_dir: "output/logs"
   crops_dir: "output/crops"
+  reports_dir: "output/reports"
+  temporary_dir: "output/tmp"
+
+  # Preserve the existing database until migration is implemented.
+  legacy_face_db_path: "models/face_recognition/face_db.pkl"
 
 # -----------------------------------------------------------------------------
-# LOGGING
+# INPUT SOURCES
+# Supported types: web_cam, video, live
+# -----------------------------------------------------------------------------
+input:
+  type: "web_cam"
+
+  camera_indices: [1]
+  video_paths:
+    - "data/sample_videos/sample.mp4"
+
+  # Do not commit real credentials in this file.
+  # Use environment-variable references or a secrets manager.
+  rtsp_urls: []
+
+  reconnect_delay_seconds: 5
+  max_reconnect_attempts: 0  # 0 = retry indefinitely
+  open_timeout_seconds: 10
+  read_timeout_seconds: 10
+  transport: "tcp"
+
+  buffer:
+    max_frames: 2
+    drop_oldest: true
+
+  display_resolution: null
+  inference_resolution: null
+
+  # Optional per-source overrides; implement in the source manager.
+  # camera_settings applies brightness, contrast, saturation, exposure, focus, gain.
+  sources: []
+  # Example:
+  #   - id: "camera_01"
+  #     type: "web_cam"
+  #     index: 0
+  #     enabled: true
+  #     camera_settings:
+  #       brightness: 128
+  #       contrast: 128
+  #       saturation: 128
+  #       exposure: 150
+  #       focus: 60
+  #       gain: 100
+
+# -----------------------------------------------------------------------------
+# PERFORMANCE
+# -----------------------------------------------------------------------------
+performance:
+  frame_skip: 0
+  inference_interval_ms: 0
+  max_inference_fps: 0  # 0 = unlimited by this setting
+  warmup_iterations: 3
+  resize_before_inference: true
+
+  # Useful when multiple sources compete for CPU resources.
+  max_concurrent_inferences: 1
+  batch_size: 1
+
+  profiling:
+    enabled: false
+    report_interval_seconds: 30
+    measure_preprocessing: true
+    measure_inference: true
+    measure_postprocessing: true
+
+# -----------------------------------------------------------------------------
+# MODELS
+# -----------------------------------------------------------------------------
+models:
+  download_policy: "if_missing"  # never, if_missing, always
+  verify_downloads: true
+  cache_enabled: true
+
+  onnx_providers:
+    - "CPUExecutionProvider"
+
+  object_detection:
+    enabled: true
+    backend: "ultralytics"
+    name: "yolov8n"
+    weights_path: "models/detection/yolov8n.pt"
+    weights_url: "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
+    input_size: [640, 640]
+    confidence_threshold: 0.45
+    iou_threshold: 0.45
+    classes_filter: null
+
+  face_detection:
+    enabled: true
+    backend: "insightface"
+    name: "scrfd"
+    pack_name: "buffalo_s"
+    weights_filename: "yolov8n-face.onnx"
+    weights_url: "https://github.com/derronqi/yolov8-face/releases/download/v0.1/yolov8n-face.onnx"
+    confidence_threshold: 0.50
+    nms_iou_threshold: 0.45
+    input_size: [640, 640]
+    min_face_size_px: 40
+
+  face_recognition:
+    enabled: true
+    backend: "insightface"
+    model_name: "arcface"
+    pack_name: "buffalo_s"
+    embedding_size: 512
+    normalize_embeddings: true
+    inference_provider: "CPUExecutionProvider"
+
+# -----------------------------------------------------------------------------
+# FACE RECOGNITION
+# Keep recognition policy in one place.
+# -----------------------------------------------------------------------------
+recognition:
+  similarity_metric: "cosine"
+  similarity_threshold: 0.45
+  unknown_label: "unknown"
+
+  matching:
+    top_k: 5
+    minimum_margin: 0.05
+    require_quality_check: true
+
+  temporal_confirmation:
+    enabled: true
+    min_consecutive_matches: 3
+    voting_window: 5
+
+  duplicate_embedding_threshold: 0.98
+  save_crops: true
+  crop_dir: "output/crops/recognized"
+  cooldown_seconds: 5
+
+# -----------------------------------------------------------------------------
+# DATA COLLECTION AND ENROLLMENT
+# -----------------------------------------------------------------------------
+data_collection:
+  output_root: "data/faces/raw"
+  samples_per_pose: 15
+  capture_interval_seconds: 0.3
+  max_samples_per_person: 300
+  allowed_image_extensions: [".jpg", ".jpeg", ".png"]
+
+  poses:
+    - "straight"
+    - "left"
+    - "right"
+    - "up"
+    - "down"
+
+  quality_checks:
+    enabled: true
+    min_brightness: 60
+    max_brightness: 200
+    blur_threshold: 100
+    min_face_size_px: 80
+    reject_multiple_faces: true
+    reject_duplicate_images: true
+
+enrollment:
+  auto_generate_identity_code: true
+  identity_code_prefix: "EMP"
+  default_name: "Mayank"
+  default_employee_id: "001"
+  require_unique_employee_id: true
+  overwrite_if_exists: true
+  require_confirmation_for_overwrite: true
+  require_minimum_samples: 10
+  generate_embeddings_after_collection: true
+  allow_incremental_enrollment: true
+
+  metadata_fields:
+    - "employee_id"
+    - "department"
+
+# -----------------------------------------------------------------------------
+# EMBEDDING DATABASE
+# -----------------------------------------------------------------------------
+database:
+  backend: "sqlite"
+  sqlite_path: "data/database/faces.db"
+
+  embedding_index:
+    backend: "faiss"
+    index_type: "FlatIP"
+    normalize_vectors: true
+
+  persistence:
+    autosave: true
+    backup_enabled: true
+    backup_interval_hours: 24
+
+# -----------------------------------------------------------------------------
+# TRACKING
+# -----------------------------------------------------------------------------
+tracking:
+  enabled: true
+  type: "iou"
+  iou_threshold: 0.30
+  max_age: 30
+  min_hits: 3
+
+  # Optional identity-level tracking.
+  identity_smoothing:
+    enabled: true
+    history_size: 5
+    minimum_votes: 3
+
+# -----------------------------------------------------------------------------
+# CROPS AND OUTPUT
+# -----------------------------------------------------------------------------
+crops:
+  save_object_crops: true
+  save_face_crops: true
+  crop_padding: 10
+  min_crop_size: 40
+  cooldown_seconds: 5
+
+  object_crop_dir: "output/crops/objects"
+  face_crop_dir: "output/crops/faces"
+  unknown_crop_dir: "output/crops/unknown"
+
+output:
+  save_detection_results: true
+  save_event_csv: true
+  save_annotated_video: false
+  image_format: "jpg"
+  jpeg_quality: 90
+
+# -----------------------------------------------------------------------------
+# LOGGING AND EVENTS
 # -----------------------------------------------------------------------------
 logging:
-  system_log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
-  system_log_max_bytes: 5242880     # 5 MB per log file before rotation
-  system_log_backup_count: 5
-  event_log_cooldown_seconds: 10    # min seconds before re-logging same track_id
-  event_csv_columns:
+  level: "INFO"
+  max_bytes: 5242880
+  backup_count: 5
+  console_enabled: true
+  file_enabled: true
+  structured_json: false
+
+events:
+  enabled: true
+  cooldown_seconds: 10
+  include_unknown_faces: true
+
+  csv_columns:
     - "timestamp"
     - "event_type"
     - "camera_id"
@@ -76,48 +299,7 @@ logging:
     - "track_id"
 
 # -----------------------------------------------------------------------------
-# MODELS — auto-downloaded on first use, cached in models/, reused after
-# -----------------------------------------------------------------------------
-models:
-  object_detection:
-    name: "yolov8n"
-    weights_url: "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt"
-    weights_filename: "yolov8n.pt"
-    onnx_filename: "yolov8n.onnx"
-    class_names_path: "configs/coco_classes.yaml"
-    input_size: [640, 640]
-    confidence_threshold: 0.45
-    iou_threshold: 0.45
-    classes_filter: null             # null = all COCO classes, or e.g. ["person", "car"]
-
-  face_detection:
-    name: "scrfd"
-    provider: "insightface"
-    pack_name: "buffalo_s"
-    confidence_threshold: 0.5
-    input_size: [640, 640]
-
-  face_recognition:
-    name: "arcface"
-    provider: "insightface"
-    pack_name: "buffalo_s"
-    similarity_threshold: 0.45
-    embedding_size: 512
-
-  onnx_providers:
-    - "CPUExecutionProvider"
-
-# -----------------------------------------------------------------------------
-# TRACKING — assigns persistent track_id, enables cooldown-based save/log
-# -----------------------------------------------------------------------------
-tracking:
-  type: "iou"                        # options: "iou", "bytetrack"
-  iou_threshold: 0.3
-  max_age: 30                        # frames to keep a lost track alive
-  min_hits: 3                        # frames before a track is confirmed
-
-# -----------------------------------------------------------------------------
-# RESOLUTION — display (UI clarity) vs inference (CPU performance), decoupled
+# DISPLAY
 # -----------------------------------------------------------------------------
 resolution:
   display:
@@ -127,69 +309,59 @@ resolution:
     width: 640
     height: 480
 
-# -----------------------------------------------------------------------------
-# DISPLAY — multi-camera rendering mode
-# -----------------------------------------------------------------------------
 display:
-  mode: "grid"                       # options: "grid", "multi_window"
+  mode: "grid"
   grid_columns: 2
   window_name_prefix: "Vision_Suite"
+  show_fps: true
+  show_confidence: true
+  show_track_id: true
+  show_unknown_label: true
+  bbox_thickness: 3
+  tight_bbox: true
+  circle_overlay: true
+  show_landmarks: true
+  enrollment_visuals: true
 
 # -----------------------------------------------------------------------------
-# DETECTION TOGGLES
+# FEATURE FLAGS
 # -----------------------------------------------------------------------------
-detection:
-  enable_object_detection: true
-  enable_face_detection: true
+features:
+  object_detection: true
+  face_detection: true
+  face_recognition: true
+  tracking: true
+  data_collection: true
+  event_logging: true
+  ear_mar: false
+  anti_spoofing: false
 
 # -----------------------------------------------------------------------------
-# CROPS — used by `frs crops`
+# EVALUATION AND BENCHMARKING
 # -----------------------------------------------------------------------------
-crops:
-  save_object_crops: true
-  save_face_crops: true
-  crop_padding: 10
-  min_crop_size: 40
-  cooldown_seconds: 5
-  object_crop_dir: "output/crops/objects"
-  face_crop_dir: "output/crops/faces"
-  unknown_crop_dir: "output/crops/unknown"
+evaluation:
+  enabled: false
+  dataset_dir: "data/evaluation"
+  output_dir: "output/reports"
+
+  recognition_metrics:
+    - "precision"
+    - "recall"
+    - "false_acceptance_rate"
+    - "false_rejection_rate"
+
+  benchmark:
+    enabled: false
+    warmup_iterations: 5
+    measurement_iterations: 100
+    report_cpu_memory: true
+    report_latency_percentiles: true
 
 # -----------------------------------------------------------------------------
-# DATA COLLECTION — used by `frs collect`, edit this section per enrollment
+# PRIVACY AND DATA RETENTION
 # -----------------------------------------------------------------------------
-data_collection:
-  person_name: "John_Doe"
-  overwrite_if_exists: true
-  details:
-    employee_id: "EMP1023"
-    department: "Security"
-  poses:
-    - "straight"
-    - "left"
-    - "right"
-    - "up"
-    - "down"
-  samples_per_pose: 15
-  capture_interval_seconds: 0.3
-  quality_checks:
-    min_brightness: 60
-    max_brightness: 200
-    blur_threshold: 100
-    min_face_size_px: 80
-
-# -----------------------------------------------------------------------------
-# RECOGNITION — used by `frs recognize`
-# -----------------------------------------------------------------------------
-recognition:
-  similarity_threshold: 0.45
-  unknown_label: "unknown"
-  save_crops: true
-  cooldown_seconds: 5
-  recognize_crop_dir: "output/crops/recognized"
-
-# -----------------------------------------------------------------------------
-# SYSTEM — future feature placeholders
-# -----------------------------------------------------------------------------
-system:
-  enable_ear_mar: false              # placeholder only, logs "not implemented yet"
+privacy:
+  delete_raw_faces_after_enrollment: false
+  unknown_crop_retention_days: 30
+  event_retention_days: 90
+  require_authorized_enrollment: true

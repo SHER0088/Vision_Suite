@@ -1,19 +1,19 @@
 """
-face_detector.py
--------------------
-Thin wrapper exposing only the face DETECTION responsibility. Loads the
-shared InsightFace engine in detection-only mode (no recognition/landmark/
-gender-age submodels) - this pipeline doesn't use embeddings, so skipping
-those forward passes is a pure speed win.
+Face detection using SCRFD via insightface.
+
+A face-specific detector — outputs face bounding boxes only.
+Model is auto-downloaded by insightface on first use and cached locally.
 """
+
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from insightface.app import FaceAnalysis
+
 from src.core.config_loader import AppConfig
-from src.detection.face_analysis_engine import get_face_analysis_engine
 from src.core.logger import get_logger
 
 logger = get_logger("face_detector")
@@ -21,28 +21,48 @@ logger = get_logger("face_detector")
 
 class FaceDetection(NamedTuple):
     confidence: float
-    bbox: tuple                        # (x1, y1, x2, y2)
-    landmarks: np.ndarray              # 5-point landmarks (from SCRFD, always available)
-    embedding: Optional[np.ndarray]    # None here - recognition module not loaded
+    bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2 in frame coordinates
+    embedding: Optional[np.ndarray] = None
 
 
 class FaceDetector:
-    def __init__(self, config: AppConfig):
-        self.engine = get_face_analysis_engine(config, need_recognition=False)
-        self.conf_threshold = config.models.face_detection.confidence_threshold
-        logger.info("FaceDetector ready (SCRFD via InsightFace, detection-only).")
+    """SCRFD face detection via insightface (ONNX Runtime CPU)."""
 
-    def detect(self, frame: np.ndarray) -> List[FaceDetection]:
-        faces = self.engine.get(frame)
-        results = []
+    def __init__(self, config: AppConfig) -> None:
+        self.cfg = config.models.face_detection
+        self.conf_threshold = float(self.cfg.confidence_threshold)
+        raw_size = self.cfg.input_size
+        self.input_size = int(raw_size) if isinstance(raw_size, (int, float)) else int(raw_size[0])
+
+        self.app = FaceAnalysis(providers=list(config.models.onnx_providers))
+        self.app.prepare(ctx_id=0, det_size=(self.input_size, self.input_size))
+
+        logger.info(
+            "FaceDetector ready | backend=insightface | input_size=%d | providers=%s",
+            self.input_size, config.models.onnx_providers,
+        )
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def detect(self, frame_bgr: np.ndarray) -> List[FaceDetection]:
+        """Run face detection on a BGR frame. Returns list of FaceDetection."""
+        if frame_bgr is None or frame_bgr.size == 0:
+            return []
+
+        faces = self.app.get(frame_bgr)
+        detections: List[FaceDetection] = []
         for face in faces:
-            if face.det_score < self.conf_threshold:
+            # insightface bbox: [x1, y1, x2, y2, score]
+            bbox = face.bbox
+            conf = float(bbox[4])
+            if conf < self.conf_threshold:
                 continue
-            x1, y1, x2, y2 = face.bbox.astype(int)
-            results.append(FaceDetection(
-                confidence=float(face.det_score),
-                bbox=(int(x1), int(y1), int(x2), int(y2)),
-                landmarks=face.kps,
-                embedding=getattr(face, "normed_embedding", None),
-            ))
-        return results
+            detections.append(
+                FaceDetection(
+                    confidence=conf,
+                    bbox=(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])),
+                )
+            )
+        return detections

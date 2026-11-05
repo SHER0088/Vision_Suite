@@ -19,15 +19,15 @@ rich==13.8.1
 torch==2.4.1
 torchvision==0.19.1
 
+# Face embedding (FaceNet InceptionResnetV1 / VGGFace2)
+facenet-pytorch>=2.5.0
+
 # ONNX stack — MUST stay matched (IR version skew = load failure)
-# onnx 1.16.x writes IR <=12/13; onnxruntime 1.19.x supports up to IR 10–13.
-# onnx>=1.20 writes IR 14 and breaks ort 1.19.x — do not upgrade.
 onnx==1.16.1
 onnxruntime==1.19.2
 ultralytics==8.3.0
 
 # Face detection + recognition (SCRFD + ArcFace via buffalo_s)
-# Prefer the prebuilt Windows cp311 wheel (avoids MSVC Cython build):
 insightface @ https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl
 # If the wheel URL ever 404s and you already have MSVC Build Tools installed, fall back to:
 # insightface==0.7.3

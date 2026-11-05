@@ -33,8 +33,8 @@ def run_crops_pipeline() -> None:
     setup_system_logger(config)
     event_logger = get_event_logger(config)
 
-    object_detector = ObjectDetector(config) if config.detection.enable_object_detection else None
-    face_detector = FaceDetector(config) if config.detection.enable_face_detection else None
+    object_detector = ObjectDetector(config) if config.features.object_detection else None
+    face_detector = FaceDetector(config) if config.features.face_detection else None
 
     object_tracker = Tracker(config)
     face_tracker = Tracker(config)

@@ -1,20 +1,20 @@
 """
-pipelines/train_pipeline.py
----------------------------
 Pipeline logic for 'frs train' command.
-Build/update the face recognition database (.pkl) from collected embeddings.
+
+Scans data/faces/raw/<name>/ for collected face images, generates embeddings
+for each, and enrolls every person in the SQLite + FAISS recognition database.
+This enables multi-sample enrollment (60-80 images per person across multiple
+poses) captured via 'frs collect'.
 """
 
 from __future__ import annotations
 
-import pickle
 import cv2
 from pathlib import Path
-from typing import Dict, List
-import numpy as np
 
 from src.core.config_loader import AppConfig, ensure_runtime_directories, get_config
-from src.core.logger import get_event_logger, get_logger, setup_system_logger
+from src.core.logger import get_logger
+from src.detection.face_detector import FaceDetector
 from src.recognition.embedder import FaceEmbedder
 from src.recognition.matcher import FaceMatcher
 from rich.console import Console
@@ -22,140 +22,118 @@ from rich.console import Console
 logger = get_logger("train_pipeline")
 console = Console()
 
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
 
 def run_train_pipeline() -> None:
-    """Pipeline logic for 'frs train'."""
+    """Train recognition model from collected raw face images.
+
+    Scans ``data/faces/raw/<name>/`` for images, generates embeddings for
+    each detected face, and enrolls every person in SQLite + FAISS with
+    all their collected samples.
+    """
     config = get_config()
     ensure_runtime_directories(config)
-    setup_system_logger(config)
-    event_logger = get_event_logger(config)
 
-    console.print("[bold cyan][Pipeline] 'frs train' started.[/bold cyan]")
+    raw_dir = Path(config.paths.raw_faces_dir)
+    if not raw_dir.exists():
+        console.print(f"[bold red]Raw faces directory not found: {raw_dir}[/bold red]")
+        console.print("[yellow]Run 'frs collect' to capture images first.[/yellow]")
+        return
 
-    # Initialize embedder and matcher
+    person_dirs = sorted([d for d in raw_dir.iterdir() if d.is_dir()])
+    if not person_dirs:
+        console.print(f"[bold red]No person directories found in {raw_dir}[/bold red]")
+        console.print("[yellow]Run 'frs collect' to capture images first.[/yellow]")
+        return
+
+    face_detector = FaceDetector(config)
     embedder = FaceEmbedder(config)
     matcher = FaceMatcher(config)
 
-    # Paths
-    faces_dir = Path(config.paths.data_dir) / config.paths.faces_dir
-    embeddings_dir = Path(config.paths.data_dir) / config.paths.embeddings_dir
-    face_db_path = Path(config.paths.face_db_path)
+    total_enrolled = 0
+    total_images = 0
 
-    # Ensure directories exist
-    faces_dir.mkdir(parents=True, exist_ok=True)
-    embeddings_dir.mkdir(parents=True, exist_ok=True)
-    face_db_path.parent.mkdir(parents=True, exist_ok=True)
+    for person_dir in person_dirs:
+        name = person_dir.name
+        image_paths = sorted(
+            p for p in person_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
+        )
 
-    logger.info("Starting face recognition database training")
-    logger.info("Faces directory: %s", faces_dir)
-    logger.info("Embeddings directory: %s", embeddings_dir)
-    logger.info("Face DB path: %s", face_db_path)
-
-    # Process each person's face images
-    person_embeddings: Dict[str, List[np.ndarray]] = {}
-    total_images_processed = 0
-    total_faces_detected = 0
-    total_embeddings_extracted = 0
-
-    if not faces_dir.exists():
-        logger.warning("Faces directory does not exist: %s", faces_dir)
-        console.print("[yellow]No face data found for training. Please run 'frs collect' first.[/yellow]")
-        return
-
-    # Iterate through each person's directory
-    for person_dir in faces_dir.iterdir():
-        if not person_dir.is_dir():
+        if not image_paths:
+            console.print(f"[yellow]Skipping {name}: no images found[/yellow]")
             continue
 
-        person_name = person_dir.name
-        logger.info("Processing person: %s", person_name)
+        console.print(f"[cyan]Processing {name}: {len(image_paths)} images[/cyan]")
 
-        # Collect all images for this person (including subdirectories like raw/)
-        image_files = []
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-            image_files.extend(person_dir.rglob(ext))
+        embeddings: list = []
+        valid_images: list[str] = []
 
-        if not image_files:
-            logger.warning("No image files found for person: %s", person_name)
+        for img_path in image_paths:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            face_dets = face_detector.detect(img)
+            if len(face_dets) == 0:
+                continue
+
+            # If multiple faces, use the largest one
+            if len(face_dets) > 1:
+                face_dets.sort(
+                    key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
+                    reverse=True,
+                )
+
+            fd = face_dets[0]
+            x1, y1, x2, y2 = fd.bbox
+            face_img = img[y1:y2, x1:x2]
+            if face_img.size == 0:
+                continue
+
+            embedding = embedder.get_embedding(face_img)
+            if embedding is None:
+                continue
+
+            embeddings.append(embedding)
+            valid_images.append(str(img_path))
+            total_images += 1
+
+        if not embeddings:
+            console.print(f"[yellow]Skipping {name}: no valid faces detected[/yellow]")
             continue
 
-        person_embeddings[person_name] = []
-        logger.info("Found %d images for person: %s", len(image_files), person_name)
+        # Enroll with first embedding (creates identity)
+        identity_id = matcher.enroll(
+            None,  # auto-generate identity_code
+            name,
+            valid_images[0],
+            embeddings[0],
+            employee_id="",
+            metadata="{}",
+        )
 
-        # Process each image
-        for image_path in image_files:
-            total_images_processed += 1
-            try:
-                # Load image
-                img = cv2.imread(str(image_path))
-                if img is None:
-                    logger.warning("Failed to load image: %s", image_path)
-                    continue
+        if identity_id is None:
+            console.print(
+                f"[yellow]Skipping {name}: enrollment failed "
+                f"(duplicate identity_code or employee_id).[/yellow]"
+            )
+            continue
 
-                # Extract embedding
-                embedding = embedder.get_embedding(img)
-                if embedding is not None:
-                    person_embeddings[person_name].append(embedding)
-                    total_embeddings_extracted += 1
-                    logger.debug("Extracted embedding from %s (shape: %s)", image_path.name, embedding.shape)
-                else:
-                    logger.warning("No face detected in image: %s", image_path)
+        # Add remaining embeddings to the same identity
+        for emb, img_path in zip(embeddings[1:], valid_images[1:]):
+            matcher.add_embedding(identity_id, emb, img_path)
 
-            except Exception as exc:
-                logger.error("Error processing image %s: %s", image_path, exc)
+        total_enrolled += 1
+        console.print(
+            f"[green]Enrolled {name} with {len(embeddings)} samples[/green]"
+        )
 
-        total_faces_detected += len(person_embeddings[person_name])
-        logger.info("Person %s: %d embeddings extracted from %d images",
-                   person_name, len(person_embeddings[person_name]), len(image_files))
+    console.print(f"\n[bold green]Training complete![/bold green]")
+    console.print(f"[dim]Persons enrolled: {total_enrolled}[/dim]")
+    console.print(f"[dim]Total images processed: {total_images}[/dim]")
 
-    # Calculate average embeddings for each person
-    logger.info("Calculating average embeddings for %d persons", len(person_embeddings))
-    face_db: Dict[str, np.ndarray] = {}
-
-    for person_name, embeddings in person_embeddings.items():
-        if embeddings:
-            # Stack embeddings and calculate mean
-            embeddings_array = np.array(embeddings)
-            mean_embedding = np.mean(embeddings_array, axis=0)
-
-            # Normalize the mean embedding
-            norm = np.linalg.norm(mean_embedding)
-            if norm > 0:
-                mean_embedding = mean_embedding / norm
-
-            face_db[person_name] = mean_embedding.astype(np.float32)
-            logger.info("Person %s: averaged %d embeddings -> norm=%.4f",
-                       person_name, len(embeddings), norm)
-        else:
-            logger.warning("No valid embeddings found for person: %s", person_name)
-
-    # Save the face database
-    if face_db:
-        try:
-            with open(face_db_path, "wb") as f:
-                pickle.dump(face_db, f)
-
-            logger.info("Face recognition database saved successfully to %s", face_db_path)
-            logger.info("Database contains %d persons", len(face_db))
-
-            # Also save individual embeddings for reference
-            for person_name, embedding in face_db.items():
-                person_embedding_dir = embeddings_dir / person_name
-                person_embedding_dir.mkdir(parents=True, exist_ok=True)
-                embedding_file = person_embedding_dir / f"{person_name}.npy"
-                np.save(str(embedding_file), embedding)
-                logger.debug("Saved individual embedding for %s to %s", person_name, embedding_file)
-
-            console.print(f"[bold green]Training completed![/bold green]")
-            console.print(f"[dim]Processed {total_images_processed} images[/dim]")
-            console.print(f"[dim]Detected {total_faces_detected} faces[/dim]")
-            console.print(f"[dim]Extracted {total_embeddings_extracted} embeddings[/dim]")
-            console.print(f"[dim]Created database with {len(face_db)} persons[/dim]")
-            console.print(f"[dim]Database saved to: {face_db_path}[/dim]")
-
-        except Exception as exc:
-            logger.error("Failed to save face database: %s", exc)
-            console.print(f"[bold red]Error saving face database: {exc}[/bold red]")
-    else:
-        logger.warning("No face data processed - database not updated")
-        console.print("[yellow]No face data found for training. Please run 'frs collect' first.[/yellow]")
+    info = matcher.get_database_info()
+    console.print(f"[dim]Identities in DB: {info['total_identities']}[/dim]")
+    console.print(f"[dim]Embeddings in DB: {info['total_embeddings']}[/dim]")

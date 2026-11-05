@@ -46,7 +46,7 @@ def setup_system_logger(config: AppConfig) -> logging.Logger:
     global _system_logger_configured
 
     logger = logging.getLogger("vision_suite")
-    logger.setLevel(getattr(logging, config.logging.system_log_level))
+    logger.setLevel(getattr(logging, config.logging.level))
 
     if _system_logger_configured:
         return logger
@@ -73,8 +73,8 @@ def setup_system_logger(config: AppConfig) -> logging.Logger:
             # Rotating file handler - rolls over within the same day if it exceeds max_bytes
             file_handler = logging.handlers.RotatingFileHandler(
                 filename=str(log_file),
-                maxBytes=config.logging.system_log_max_bytes,
-                backupCount=config.logging.system_log_backup_count,
+                maxBytes=config.logging.max_bytes,
+                backupCount=config.logging.backup_count,
                 encoding="utf-8",
             )
             file_handler.setFormatter(formatter)
@@ -131,8 +131,8 @@ class EventLogger:
         except OSError as e:
             self.logger.error(f"Failed to create logs directory {config.paths.logs_dir}: {e}")
             raise
-        self.cooldown_seconds = float(config.logging.event_log_cooldown_seconds)
-        self.columns = config.logging.event_csv_columns or [
+        self.cooldown_seconds = float(config.events.cooldown_seconds)
+        self.columns = config.events.csv_columns or [
             "timestamp", "event_type", "camera_id", "class_or_name",
             "confidence", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
             "crop_path", "track_id",

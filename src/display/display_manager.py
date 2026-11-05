@@ -10,6 +10,9 @@ Features:
 - Timestamp overlay on every frame
 - Multi-window mode with per-window camera titles
 - Professional bounding-box & label rendering helpers
+- Modern face-enrollment overlay: circle fit, eye/nose/mouth landmarks
+- Tight-fit bounding boxes with per-class padding control
+- Enrollment visual guide (pose instructions + progress)
 """
 
 from __future__ import annotations
@@ -40,6 +43,15 @@ COLOR_ACCENT = (0, 180, 255)     # cyan accent
 COLOR_OK = (0, 255, 120)         # green for live
 COLOR_WARN = (0, 165, 255)       # orange for warning
 COLOR_ERR = (0, 0, 255)          # red for error/disconnected
+
+# Enrollment overlay colors
+COLOR_ENROLL_CENTER = (0, 255, 255)   # yellow circle when face centered
+COLOR_ENROLL_OFF = (0, 100, 255)      # blue circle when face off-center
+COLOR_ENROLL_GOOD = (0, 255, 0)       # green for good pose
+COLOR_ENROLL_BAD = (0, 0, 255)        # red for bad pose
+COLOR_LANDMARK_EYE = (255, 255, 0)    # cyan for eye landmarks
+COLOR_LANDMARK_NOSE = (255, 120, 0)   # azure for nose
+COLOR_LANDMARK_MOUTH = (255, 0, 120)  # rose for mouth
 
 # Class-based bounding box colors (distinct, professional)
 CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -75,6 +87,13 @@ class FPSCounter:
         """Record a frame and return the current smoothed FPS."""
         now = time.time()
         self._stamps.append(now)
+        return self._compute()
+
+    def get_fps(self) -> float:
+        """Return the current smoothed FPS without recording a new frame."""
+        return self._compute()
+
+    def _compute(self) -> float:
         if len(self._stamps) < 2:
             return 0.0
         span = self._stamps[-1] - self._stamps[0]
@@ -82,6 +101,10 @@ class FPSCounter:
             return 0.0
         return (len(self._stamps) - 1) / span
 
+
+# ---------------------------------------------------------------------------
+# Camera status
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CameraStatus:
@@ -127,6 +150,15 @@ class DisplayConfig:
     mode: str  # "grid" or "multi_window"
     grid_columns: int
     window_name_prefix: str
+    show_fps: bool = True
+    show_confidence: bool = True
+    show_track_id: bool = True
+    show_unknown_label: bool = True
+    bbox_thickness: int = 3
+    tight_bbox: bool = True
+    circle_overlay: bool = True
+    show_landmarks: bool = True
+    enrollment_visuals: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +166,7 @@ class DisplayConfig:
 # ---------------------------------------------------------------------------
 
 class DisplayManager:
-    """Professional multi-camera display manager."""
+    """Professional multi-camera display manager with modern overlay support."""
 
     def __init__(self, config: AppConfig):
         self.config = config
@@ -145,9 +177,13 @@ class DisplayManager:
         self._start_time = time.time()
 
         logger.info(
-            "DisplayManager initialized | mode=%s | grid_columns=%d",
+            "DisplayManager initialized | mode=%s | grid_columns=%d | "
+            "circle_overlay=%s | tight_bbox=%s | show_landmarks=%s",
             self.display_cfg.mode,
             self.display_cfg.grid_columns,
+            getattr(self.display_cfg, "circle_overlay", True),
+            getattr(self.display_cfg, "tight_bbox", True),
+            getattr(self.display_cfg, "show_landmarks", True),
         )
 
     # ------------------------------------------------------------------ #
@@ -234,10 +270,33 @@ class DisplayManager:
         label: str,
         color: Optional[Tuple[int, int, int]] = None,
         thickness: int = 3,
+        tight: bool = True,
+        padding: int = 5,
     ) -> None:
-        """Draw a professional bounding box with label background."""
+        """Draw a professional bounding box with label background.
+
+        Args:
+            img: Target BGR image to draw on.
+            bbox: (x1, y1, x2, y2) in image coordinates.
+            label: Text label to show above the box.
+            color: BGR color for the box. Defaults to class default.
+            thickness: Line thickness for the box.
+            tight: If True, shrink the box inward by `padding` for a tighter fit.
+            padding: Inner padding when tight=True.
+        """
         x1, y1, x2, y2 = bbox
         color = color or CLASS_COLORS["default"]
+
+        # Apply tight-fit: shrink box inward so it hugs the object, not the background
+        if tight:
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            w = (x2 - x1) // 2 - padding
+            h = (y2 - y1) // 2 - padding
+            x1 = max(0, cx - w)
+            y1 = max(0, cy - h)
+            x2 = min(img.shape[1], cx + w)
+            y2 = min(img.shape[0], cy + h)
 
         # Bounding box
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
@@ -250,6 +309,180 @@ class DisplayManager:
             img, label, (x1 + 5, label_y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_BG, 2,
         )
+
+    # ------------------------------------------------------------------ #
+    # Modern face-enrollment overlay (Apple / Android style)
+    # ------------------------------------------------------------------ #
+
+    def draw_enrollment_circle(
+        self,
+        img: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        centered: bool = True,
+        radius_padding: float = 0.35,
+    ) -> None:
+        """Draw a circle overlay that fits the face, like modern enrollment UX.
+
+        The circle is sized to snugly contain the face bbox with optional padding.
+        Color indicates whether the face is centered (green) or off-center (blue).
+
+        Args:
+            img: Target BGR image.
+            bbox: (x1, y1, x2, y2) face bounding box.
+            centered: Whether the face is centered in the circle.
+            radius_padding: Extra radius as fraction of face width (0.0 = tight).
+        """
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        face_w = x2 - x1
+        face_h = y2 - y1
+        radius = int(max(face_w, face_h) * (0.5 + radius_padding))
+
+        color = COLOR_ENROLL_CENTER if centered else COLOR_ENROLL_OFF
+        thickness = 3
+
+        # Outer enrollment circle
+        cv2.circle(img, (cx, cy), radius, color, thickness)
+
+        # Inner thin ring for visual polish
+        cv2.circle(img, (cx, cy), radius - 6, color, 1)
+
+        # Center dot (where nose should be)
+        cv2.circle(img, (cx, cy), 4, color, -1)
+
+        # Face-position indicator text
+        status_text = "CENTER" if centered else "ADJUST"
+        self._put_text_with_bg(
+            img, status_text, (cx - 30, cy + radius + 18),
+            font_scale=0.5,
+            color=color,
+            bg_color=COLOR_BG,
+            thickness=1,
+            pad=3,
+        )
+
+    def draw_face_landmarks(
+        self,
+        img: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        show_eyes: bool = True,
+        show_nose: bool = True,
+        show_mouth: bool = True,
+    ) -> None:
+        """Draw estimated facial landmarks (eyes, nose, mouth) on a face bbox.
+
+        These are approximate positions based on the bbox proportions, suitable
+        for visualization during enrollment and recognition preview. When actual
+        landmark detection (EAR/MAR) is wired in, these points can be replaced
+        with real coordinates.
+
+        Args:
+            img: Target BGR image.
+            bbox: (x1, y1, x2, y2) face bounding box.
+            show_eyes: Draw left/right eye markers.
+            show_nose: Draw nose marker.
+            show_mouth: Draw mouth marker.
+        """
+        x1, y1, x2, y2 = bbox
+        fw = x2 - x1
+        fh = y2 - y1
+        cx = (x1 + x2) // 2
+
+        # Eye positions: roughly 35% down from top, at 30% and 70% of width
+        eye_y = y1 + int(fh * 0.35)
+        eye_offset = int(fw * 0.22)
+        if show_eyes:
+            cv2.circle(img, (cx - eye_offset, eye_y), 5, COLOR_LANDMARK_EYE, -1)
+            cv2.circle(img, (cx + eye_offset, eye_y), 5, COLOR_LANDMARK_EYE, -1)
+            # Small crosshair for each eye
+            cv2.line(img, (cx - eye_offset - 3, eye_y), (cx - eye_offset + 3, eye_y), COLOR_LANDMARK_EYE, 1)
+            cv2.line(img, (cx + eye_offset - 3, eye_y), (cx + eye_offset + 3, eye_y), COLOR_LANDMARK_EYE, 1)
+
+        # Nose: roughly 55% down, centered
+        nose_y = y1 + int(fh * 0.55)
+        if show_nose:
+            cv2.circle(img, cx, nose_y, 4, COLOR_LANDMARK_NOSE, -1)
+
+        # Mouth: roughly 75% down, centered
+        mouth_y = y1 + int(fh * 0.75)
+        if show_mouth:
+            cv2.circle(img, cx, mouth_y, 4, COLOR_LANDMARK_MOUTH, -1)
+            cv2.line(img, cx - 6, mouth_y, cx + 6, mouth_y, COLOR_LANDMARK_MOUTH, 2)
+
+    # ------------------------------------------------------------------ #
+    # Enrollment visual guide
+    # ------------------------------------------------------------------ #
+
+    def draw_enrollment_guide(
+        self,
+        img: np.ndarray,
+        pose: str = "straight",
+        samples_collected: int = 0,
+        samples_target: int = 15,
+        face_centered: bool = True,
+        face_bbox: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
+        """Draw an enrollment overlay guide on the frame.
+
+        Shows:
+        - Current pose instruction (straight / left / right / up / down)
+        - Collection progress (samples collected / target)
+        - Face centering guidance
+        - Center circle overlay when a face bbox is provided
+
+        Args:
+            img: Target BGR image.
+            pose: Current target pose name.
+            samples_collected: Number of samples captured so far.
+            samples_target: Total samples needed for this pose.
+            face_centered: Whether the detected face is centered.
+            face_bbox: Optional face bounding box for circle overlay.
+        """
+        h, w = img.shape[:2]
+
+        # Progress bar at top center
+        progress = min(samples_collected / max(samples_target, 1), 1.0)
+        bar_w = 300
+        bar_h = 10
+        bar_x = (w - bar_w) // 2
+        bar_y = 40
+
+        # Background bar
+        cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), COLOR_PANEL, -1)
+        # Fill
+        if progress > 0:
+            fill_w = int(bar_w * progress)
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), COLOR_ACCENT, -1)
+        # Border
+        cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), COLOR_TEXT, 1)
+
+        # Progress text
+        prog_text = f"{pose.upper()}  {samples_collected}/{samples_target}"
+        (tw, th), _ = cv2.getTextSize(prog_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        self._put_text_with_bg(
+            img, prog_text, ((w - tw) // 2, bar_y + bar_h + 30),
+            font_scale=0.7,
+            color=COLOR_TEXT,
+            bg_color=COLOR_PANEL,
+            thickness=2,
+        )
+
+        # Face centering hint
+        hint_text = "CENTER YOUR FACE" if face_centered else "MOVE FACE TO CENTER"
+        hint_color = COLOR_ENROLL_GOOD if face_centered else COLOR_ENROLL_OFF
+        (htw, hth), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        self._put_text_with_bg(
+            img, hint_text, ((w - htw) // 2, h - 60),
+            font_scale=0.6,
+            color=hint_color,
+            bg_color=COLOR_BG,
+            thickness=2,
+        )
+
+        # Draw enrollment circle if face bbox provided
+        if face_bbox is not None:
+            self.draw_enrollment_circle(img, face_bbox, centered=face_centered)
 
     # ------------------------------------------------------------------ #
     # Per-frame overlay
@@ -282,7 +515,7 @@ class DisplayManager:
         cv2.circle(frame, (12, 24), 6, dot_color, -1)
 
         # Top-right: FPS + detection count
-        fps_text = f"FPS: {status.fps.tick():.1f}" if status.connected else "FPS: --"
+        fps_text = f"FPS: {status.fps.get_fps():.1f}" if status.connected else "FPS: --"
         det_text = f"Dets: {detection_count}"
         info_text = f"{fps_text}   {det_text}"
         (tw, _), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -309,7 +542,6 @@ class DisplayManager:
 
         # Bottom-left: resolution
         res_text = f"{w}×{h}"
-        (_, _), _ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         self._put_text_with_bg(
             frame, res_text, (15, h - 15),
             font_scale=0.6,

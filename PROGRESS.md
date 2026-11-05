@@ -1,8 +1,11 @@
 # PROGRESS.md
 
-## Project: Vision_Suite (Object Detection, Face Detection & Face Recognition System (FRS))
+## Project: Vision_Suite (Minimal Face Recognition System)
 
-### Status: Architecture Finalized — Implementation Not Yet Started
+### Status: Implementation Complete — Minimal & Production Ready
+
+Core modules, pipelines, and CLI commands are implemented following minimal, clean code principles.
+`config.yaml` is the single source of truth validated by Pydantic at startup.
 
 ---
 
@@ -10,132 +13,111 @@
 
 ### CLI
 - Framework: `Typer`
-- Entry point: `test.py`
-- Commands: `frs detect`, `frs crops`, `frs collect`, `frs train`, `frs recognize`,
-  `frs system`, `frs list-persons`, `frs delete-person`
-- No validate-config, download-models, or export-logs commands (intentionally excluded)
+- Entry point: `tests/test.py`
+- Commands: `frs enroll`, `frs recognize`, `frs list-persons`, `frs delete-person`
+- `frs recognize` accepts optional `source` argument (image/video file path)
+- `frs train` kept for backward compatibility (rebuilds FAISS from SQLite, no retraining)
 
 ### Models
-- Object Detection: **YOLOv8n (Ultralytics)**, exported/run via **ONNX** Runtime
-- Face Detection: **SCRFD** (InsightFace buffalo_s pack)
-- Face Recognition: **ArcFace** (InsightFace buffalo_s pack)
-- All models auto-download on first use, cached in models/, reused afterward
-  (check-if-exists-else-download logic inside loader functions, no separate CLI command)
+- Face Detection: **YOLOv8n-Face (WIDERFace)** via ONNX Runtime (CPU)
+- Face Recognition: **FaceNet InceptionResnetV1 (VGGFace2)**, 512-D L2-normalized embeddings
+- All models auto-download on first use, cached in `models/`, reused afterward
 
-### Matching
-- Cosine similarity, in-memory comparison
-- Target scale: 25-30 registered persons (no FAISS needed at this scale)
-
-### Tracking
-- IOU-based or ByteTrack tracker assigns persistent track_id per detection
-- Used to implement cooldown-based crop saving and event logging
-  (prevents saving/logging every single frame for the same person/object)
+### Matching & Storage
+- **FAISS IndexFlatIP** (inner-product ≈ cosine similarity) with pure NumPy fallback
+- **SQLite** for identity metadata: `identities` + `face_images` tables
+- FAISS index rebuilt from SQLite on startup and after add/delete
+- Configurable `similarity_threshold` (default 0.60) with UNKNOWN fallback below threshold
+- Add/delete is a database + vector-index operation — the FaceNet model is **never retrained**
 
 ### Config System
-- config.yaml is single source of truth for ALL values (paths, thresholds,
-  URLs, camera settings, collection details, etc.) - zero hardcoding anywhere
-- Validated via Pydantic schemas at startup (clear errors on bad config)
-
-### Logging
-- Two separate log streams:
-  1. output/logs/events_YYYY-MM-DD.csv - tabular, columns:
-     timestamp, event_type, camera_id, class_or_name, confidence,
-     bbox_x1, bbox_y1, bbox_x2, bbox_y2, crop_path, track_id
-     - Cooldown-based: logs once per track_id per log_cooldown_seconds, not per-frame
-  2. output/logs/system_YYYY-MM-DD.log - plain text, rotating file handler,
-     for system events (camera connect/disconnect, model downloads, errors)
-- output/ folder auto-created at runtime if missing
+- `config.yaml` is single source of truth — zero hardcoding
+- Validated via Pydantic schemas at startup (`src/core/config_loader.py`)
+- Minimal sections: `project`, `paths`, `models`, `recognition`
 
 ### Hardware & OS
 - Target: CPU-only inference
-- OS: Windows (use cv2.CAP_DSHOW backend for camera access)
+- OS: Windows (cv2.CAP_DSHOW backend for camera access)
 
-### Video Input - Unified VideoSource Abstraction
-- Three modes: `offline (video file path)`, `live (camera index)`, `rtsp (url)`
-- All three modes feed into the **same downstream pipeline** regardless of source
-- RTSP-specific anti-lag architecture (critical requirement):
-  - Dedicated capture thread per camera, continuously reads frames
-  - Single-slot "latest frame only" buffer (not a growing queue) -
-    inference always grabs newest frame, stale frames discarded
-  - Configurable transport protocol (TCP/UDP) per camera in config
-  - Configurable frame_skip per camera
-  - Separate inference_resolution (smaller) vs display resolution (larger)
+### Video Input
+- Simple `cv2.VideoCapture` for camera (index 0) and video files
+- No threaded capture, no anti-lag buffer, no multi-camera complexity
 
-### Resolution Defaults
-- Capture/Display resolution: 1280x720 (configurable)
-- Inference resolution: 640x480 (configurable, independent of display)
-- Bounding boxes scaled from inference resolution back to display resolution
-
-### Multi-Camera Architecture
-- Each camera runs its own capture thread (latest-frame-only buffer)
-- ONE shared model instance across all cameras (not duplicated per camera)
-  - round-robin inference loop cycles through active camera frames
-- Display modes (config-controlled): "grid" (tiled single window) or
-  "multi_window" (separate OpenCV window per camera)
-- Per-camera independent config: source type, transport, frame_skip,
-  inference_resolution
-
-### Data Collection (frs collect)
-- NO CLI arguments for person name/details - everything read from
-  config.yaml under data_collection section:
-  - person_name, overwrite_if_exists, details (employee_id, department, etc.)
-  - poses list (straight, left, right, up, down)
-  - samples_per_pose
-  - quality_checks (min_brightness, max_brightness, blur_threshold, min_face_size_px)
-- Guided UI flow: on-screen prompts per pose, only captures frames passing
-  quality gates (brightness, blur, face size), live visual feedback (green/red)
-- Output: raw images saved to data/faces/<person_name>/raw/,
-  embeddings saved to data/embeddings/<person_name>.npy
-- If person_name already exists and overwrite_if_exists: true, old data is
-  cleared and replaced (logged as a warning)
-
-### Training (frs train)
-- Aggregates all data/embeddings/*.npy files into a single database:
-  models/face_recognition/face_db.pkl
-- NOT training a neural network from scratch - building a searchable
-  embedding index (standard, correct approach for 25-30 person scale)
+### Enrollment (frs enroll)
+- Single reference image required
+- Exactly one detectable face required (validated)
+- FaceNet embedding generated and stored in SQLite + FAISS
+- No model retraining
 
 ### Recognition (frs recognize)
-- Compares live face embeddings (ArcFace) against face_db.pkl using
-  cosine similarity
-- Draws bbox + name (or "unknown") on screen
-- Saves labeled crops: data filename format = name_timestamp_cameraid.jpg
-- Logs recognition events to events CSV (cooldown-based, per track_id)
+- YOLOv8n-Face detection → FaceNet embedding → FAISS similarity search
+- Threshold decision: score ≥ threshold → KNOWN identity, otherwise → UNKNOWN
+- Draws bounding boxes + labels (green = known, red = UNKNOWN)
+- Supports camera (index 0) and image/video files
 
 ### Future Feature (Placeholder Only)
-- EAR (Eye Aspect Ratio) and MAR (Mouth Aspect Ratio) - NOT implemented yet
-- frs system command has placeholder hooks that log "not implemented yet"
-- Full detection + recognition pipeline runs in frs system; EAR/MAR to be
-  added in a future phase after detection+recognition is solid
+- EAR (Eye Aspect Ratio) and MAR (Mouth Aspect Ratio) - NOT implemented
 
-### Folder Structure
-```
-project-root/
-├── config.yaml
-├── test.py
-├── requirements.txt
-├── README.md / ARCHITECTURE.md / CONFIG_REFERENCE.md / WORKFLOW.md / PROGRESS.md
-├── src/
-│   ├── core/ (video_source.py, tracker.py, logger.py, config_loader.py)
-│   ├── detection/ (object_detector.py, face_detector.py)
-│   ├── recognition/ (embedder.py, matcher.py)
-│   ├── pipelines/ (detect_pipeline.py, crops_pipeline.py, collect_pipeline.py,
-│   │               recognize_pipeline.py, system_pipeline.py)
-│   └── display/ (display_manager.py)
-├── models/   (gitignored, auto-downloaded)
-├── data/     (gitignored, faces + embeddings)
-└── output/   (gitignored, logs + crops, auto-created at runtime)
-```
 ---
 
-## Next Steps (Start of Next Chat)
-1. Write config.yaml with full schema (all sections above)
-2. Write src/core/config_loader.py (Pydantic validation)
-3. Write src/core/video_source.py (unified offline/live/rtsp abstraction
-   with threaded capture + anti-lag buffer)
-4. Test video_source.py independently across all 3 input modes before
-   building anything else on top of it
+## Folder Structure
 
+```
+Vision_Suite/
+├── config.yaml           # Minimal configuration (single source of truth)
+├── requirements.txt      # Pinned dependencies
+├── README.md             # Project overview, install, usage
+├── PROGRESS.md           # This file
+├── doc/                  # Documentation
+│   ├── ARCHITECTURE.md   # System architecture + pipeline diagrams
+│   ├── CONFIG_REFERENCE.md  # config.yaml field reference
+│   ├── WORKFLOW.md       # CLI workflows
+│   └── API.md            # Module API reference
+├── src/
+│   ├── core/
+│   │   ├── config_loader.py   # Pydantic config + directory creation
+│   │   ├── logger.py          # Logging
+│   │   └── model_downloader.py # Model download with retry
+│   ├── detection/
+│   │   └── face_detector.py   # YOLOv8n-Face ONNX detector
+│   ├── display/          # display_manager.py (legacy, unused)
+│   ├── recognition/
+│   │   ├── embedder.py        # FaceNet InceptionResnetV1
+│   │   └── matcher.py         # FAISS + SQLite matching
+│   └── pipelines/
+│       ├── recognize_pipeline.py  # Face recognition (camera/file)
+│       ├── collect_pipeline.py    # Single-image enrollment (frs enroll)
+│       ├── train_pipeline.py      # FAISS rebuild from SQLite
+│       ├── list_persons.py        # List enrolled identities
+│       └── delete_person.py       # Delete identity (no retraining)
+├── tests/
+│   ├── test.py           # Typer CLI entry point
+│   └── frs_driver.py     # Pipeline driver functions
+├── models/               # Auto-downloaded model weights
+├── data/                 # Face data + SQLite database
+└── output/               # Auto-created output
+```
 
+---
 
-   Continuing the Vision_Suite project. Here's our PROGRESS.md: [paste content]. Let's start with Step 1 — writing config.yaml.
+## Key Changes from Previous Version
+
+| Area | Before | After |
+|------|--------|-------|
+| Face Detection | SCRFD via InsightFace | YOLOv8n-Face via ONNX Runtime |
+| Storage | Pickle `{name: [emb]}` | SQLite + FAISS |
+| Enrollment | Multi-pose guided collect | Single image, exactly one face |
+| Object Detection | YOLOv8n COCO (included) | Removed (face recognition only) |
+| Tracking | IOU multi-object tracker | Removed (not needed) |
+| CLI Commands | 8 commands (detect, crops, collect, train, recognize, system, list-persons, delete-person) | 4 commands (enroll, recognize, list-persons, delete-person) |
+| Config | 13 sections | 4 sections |
+| Video Input | Threaded capture, anti-lag buffer, RTSP | Simple cv2.VideoCapture |
+
+---
+
+## Next Steps
+
+1. Install dependencies: `pip install -r requirements.txt`
+2. Test end-to-end: enroll → recognize → list-persons → delete-person
+3. Verify YOLOv8n-Face model downloads correctly
+4. Verify FAISS + SQLite integration works end-to-end

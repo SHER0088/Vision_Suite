@@ -1,21 +1,15 @@
 """
 face_analysis_engine.py
 ---------------------------
-Shared InsightFace engine (SCRFD detector + ArcFace recognizer bundled
-as the 'buffalo_s' pack). Loaded ONCE as a singleton - both face_detector.py
-and the future recognition/embedder.py pull from this same instance to
-avoid loading the model pack twice and wasting CPU/RAM.
-
-`need_recognition` controls which submodels from the pack get loaded:
-- False -> only the SCRFD detector loads (bbox/landmarks/score only).
-  Used by pure detection pipelines (frs detect / frs crops) - skips the
-  recognition, landmark, and gender/age forward passes entirely, since
-  those cost real CPU time per face per frame for data nobody uses yet.
-- True  -> full pack loads (detection + recognition). Used by pipelines
-  that need embeddings (frs collect / frs train / frs recognize / frs system).
+DEPRECATED — Legacy InsightFace engine module. Previously used by SCRFD-based face
+detection. Face detection now uses YOLOv8n-Face directly in
+src/detection/face_detector.py. Face recognition uses FaceNet in
+src/recognition/embedder.py. This module is NOT imported by any active pipeline
+and will be removed in a future release.
 """
 from __future__ import annotations
 
+import warnings
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -24,6 +18,14 @@ from src.core.config_loader import AppConfig
 from src.core.logger import get_logger
 
 logger = get_logger("face_analysis_engine")
+
+warnings.warn(
+    "face_analysis_engine is deprecated and unused by active pipelines. "
+    "Use src/detection/face_detector.py for detection and "
+    "src/recognition/embedder.py for recognition.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 _engine_instance: Optional[Any] = None
 _engine_need_recognition: Optional[bool] = None

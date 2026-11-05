@@ -32,8 +32,8 @@ def run_detect_pipeline() -> None:
     setup_system_logger(config)
     event_logger = get_event_logger(config)
 
-    object_detector = ObjectDetector(config) if config.detection.enable_object_detection else None
-    face_detector = FaceDetector(config) if config.detection.enable_face_detection else None
+    object_detector = ObjectDetector(config) if config.features.object_detection else None
+    face_detector = FaceDetector(config) if config.features.face_detection else None
 
     object_tracker = Tracker(config)
     face_tracker = Tracker(config)
@@ -135,7 +135,7 @@ def run_detect_pipeline() -> None:
                 # 2. Face Detections
                 if face_detector and inf_img is not None:
                     face_dets = face_detector.detect(inf_img)
-                    raw_faces = [(f.bbox, f.confidence, "face", f.embedding) for f in face_dets]
+                    raw_faces = [(f.bbox, f.confidence, "face", None) for f in face_dets]
                     tracked_faces = face_tracker.update(raw_faces)
 
                     for f in tracked_faces:

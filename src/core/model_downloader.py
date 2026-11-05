@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import time
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 from urllib.request import urlopen, Request
 
 from src.core.logger import get_logger
@@ -50,19 +50,17 @@ except ImportError:
         return _NoOpBar()
 
 
-def _make_url(url: str, timeout: int = _INITIAL_TIMEOUT) -> Request:
+def _make_url(url: str) -> Request:
     """Build a urllib Request with proper headers."""
     headers = {"User-Agent": "VisionSuite/1.0"}
-    return Request(url, headers=headers, timeout=timeout)
+    return Request(url, headers=headers)
 
 
-def ensure_file(local_path: Union[str, Path], url: str, description: str = "model file") -> Path:
+def ensure_file(local_path: Union[str, Path], url: str, description: str = "model file") -> Optional[Path]:
     """
     Ensures a file exists locally. If missing, downloads it from `url`
-    with a progress bar. Returns the resolved local Path.
-
-    Raises RuntimeError on failure - this is treated as fatal since
-    nothing downstream can function without the model.
+    with a progress bar. Returns the resolved local Path, or None if the
+    file could not be obtained (missing locally and download failed).
 
     Features:
     - Retry with exponential backoff (3 attempts)
@@ -84,8 +82,8 @@ def ensure_file(local_path: Union[str, Path], url: str, description: str = "mode
     last_exception = None
     for attempt in range(_MAX_RETRIES):
         try:
-            req = _make_url(url, timeout=_INITIAL_TIMEOUT * (attempt + 1))
-            with urlopen(req) as response:
+            req = _make_url(url)
+            with urlopen(req, timeout=_INITIAL_TIMEOUT * (attempt + 1)) as response:
                 total_size = int(response.headers.get("content-length", 0))
 
                 # Clean up any existing partial download
@@ -128,7 +126,4 @@ def ensure_file(local_path: Union[str, Path], url: str, description: str = "mode
                 time.sleep(wait_time)
 
     logger.error(f"All download attempts failed for {description} from {url}")
-    raise RuntimeError(
-        f"Could not download required {description} after {_MAX_RETRIES} attempts. "
-        f"Check your internet connection or verify the URL in config.yaml: {url}"
-    ) from last_exception
+    return None
